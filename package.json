@@ -1,0 +1,23 @@
+{
+  "name": "hermes-splash-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Splash Studio for Hermes Desktop: customize the new-chat screen with imagery, widgets and your own title.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BeyondGoodIO/hermes-splash-studio.git"
+  },
+  "scripts": {
+    "test": "node --check plugin.js && node test/plugin.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
+}

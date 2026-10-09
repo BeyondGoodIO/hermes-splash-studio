@@ -1,14 +1,14 @@
 /**
- * Stagehand: dress the empty new-chat screen in the Hermes desktop app.
+ * Splash Studio for Hermes Desktop: customize the empty new-chat screen.
  *
  * - Imagery behind the splash (presets or your own image)
  * - Side widgets: clock + greeting, profile and model, recent chats, starter prompts
  * - The big title: rewrite it, restyle it (font, size, color), or hide it
  *
- * Install: copy this folder to ~/.hermes/desktop-plugins/stagehand.
+ * Install: copy this folder to ~/.hermes/desktop-plugins/splash-studio.
  * The app picks it up within a few seconds (fallback: Cmd+K, "Reload desktop plugins").
  * Plain ESM, no build step. Ongoing chats are never touched.
- * v2.1.0
+ * v1.0.0 · MIT · https://github.com/BeyondGoodIO/hermes-splash-studio
  */
 
 import {
@@ -27,10 +27,13 @@ import {
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const ID = 'stagehand'
-const STYLE_ID = 'stagehand-css'
-const TITLE_STYLE_ID = 'stagehand-title-css'
-const TITLE_ATTR = 'data-stagehand'
+const ID = 'splash-studio'
+const NAME = 'Splash Studio'
+const STYLE_ID = 'splash-studio-css'
+const TITLE_STYLE_ID = 'splash-studio-title-css'
+const TITLE_ATTR = 'data-splash-studio'
+// Pre-release id; settings saved under it are carried over once.
+const LEGACY_ID = 'stagehand'
 const MAX_IMAGE_CHARS = 900_000
 const MAX_PROMPTS = 3
 const INTRO = '[data-slot="aui_intro"]'
@@ -647,7 +650,7 @@ function paintArt(art, prefs) {
   art.dataset.shMissing = String(missingCustom)
   art.style.backgroundImage = cssUrl(url)
   if (missingCustom) {
-    $imageError.set(broken ? 'That image URL did not load.' : 'Add an image in Stagehand settings.')
+    $imageError.set(broken ? 'That image URL did not load.' : `Add an image in ${NAME} settings.`)
     return
   }
   if (prefs.imagery !== 'custom' || !/^https:/i.test(url)) {
@@ -1038,13 +1041,14 @@ function SettingsPanel() {
         onClick: () => {
           if (host.settings && typeof host.settings.set === 'function') {
             host.settings.set('intro-splash.v1', true)
-            host.notify?.({ kind: 'info', message: 'Intro splash is on. Open a new chat to see the stage.' })
+            host.notify?.({ kind: 'info', message: 'Intro splash is on. Open a new chat to see it.' })
           } else {
             host.notify?.({ kind: 'info', message: 'This Hermes version cannot change that from a plugin. Check Settings > Appearance.' })
           }
         },
         children: 'Make sure the new-chat splash is on'
-      })
+      }),
+      jsx(ResetButton, {})
     ]
   })
 }
@@ -1180,7 +1184,7 @@ function WidgetToggle({ label, checked, onChange }) {
 function StatusChip() {
   const prefs = useValue($prefs)
   return jsx(Tip, {
-    label: prefs.enabled ? 'Stagehand is on. Click to hide it.' : 'Stagehand is off. Click to show it.',
+    label: prefs.enabled ? `${NAME} is on. Click to hide it. Right-click for settings.` : `${NAME} is off. Click to show it.`,
     children: jsx('button', {
       type: 'button',
       className: cn(
@@ -1195,18 +1199,79 @@ function StatusChip() {
         event.preventDefault()
         openSettings()
       },
-      children: 'stage'
+      children: 'splash'
     })
+  })
+}
+
+// One-time carry-over of settings saved under the pre-release id. The new copy is written
+// and verified before the old one is removed, so a full storage never loses the image.
+function migrateLegacy(ctx) {
+  try {
+    if (ctx.storage.get('prefs', undefined) !== undefined) return
+    const store = window.localStorage
+    const base = `hermes.plugin.${LEGACY_ID}.`
+    for (const key of ['prefs', 'image']) {
+      const raw = store.getItem(base + key)
+      if (raw === null) continue
+      const value = JSON.parse(raw)
+      ctx.storage.set(key, value)
+      if (JSON.stringify(ctx.storage.get(key, null)) === JSON.stringify(value)) store.removeItem(base + key)
+    }
+  } catch {
+    // Nothing to carry over, or storage unavailable: start from defaults.
+  }
+}
+
+function resetPrefs() {
+  updatePrefs({
+    ...DEFAULTS,
+    widgets: { ...DEFAULTS.widgets },
+    prompts: DEFAULTS.prompts.slice(),
+    title: { ...DEFAULTS.title }
+  })
+  failedUrls.clear()
+}
+
+function ResetButton() {
+  const [armed, setArmed] = useState(false)
+
+  useEffect(() => {
+    if (!armed) return undefined
+    const timer = setTimeout(() => setArmed(false), 4000)
+    return () => clearTimeout(timer)
+  }, [armed])
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsx(Button, {
+        type: 'button',
+        variant: 'ghost',
+        onClick: () => {
+          if (!armed) {
+            setArmed(true)
+            return
+          }
+          setArmed(false)
+          resetPrefs()
+          host.notify?.({ kind: 'info', message: `${NAME} settings are back to defaults.` })
+        },
+        children: armed ? 'Click again to reset' : 'Reset settings to defaults'
+      }),
+      jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: 'Keeps your saved image. Use Clear saved image to remove it.' })
+    ]
   })
 }
 
 export default {
   id: ID,
-  name: 'Stagehand',
+  name: NAME,
   register(ctx) {
     pluginCtx = ctx
     disposed = false
     sessionsCache = { at: 0, rows: [] }
+    migrateLegacy(ctx)
     const stored = ctx.storage.get('prefs', {})
     $prefs.set(clonePrefs(stored && typeof stored === 'object' ? stored : {}))
     localImage = safeImageUrl(ctx.storage.get('image', ''))
@@ -1225,8 +1290,8 @@ export default {
       area: 'palette',
       data: {
         id: `${ID}.customize`,
-        label: 'Customize Stagehand',
-        keywords: ['background', 'wallpaper', 'widgets', 'new chat', 'imagery'],
+        label: `Customize ${NAME}`,
+        keywords: ['background', 'wallpaper', 'widgets', 'new chat', 'imagery', 'splash', 'title'],
         run: openSettings
       }
     })
@@ -1236,8 +1301,8 @@ export default {
       area: 'palette',
       data: {
         id: `${ID}.toggle`,
-        label: 'Toggle Stagehand',
-        keywords: ['background', 'hide', 'show'],
+        label: `Toggle ${NAME}`,
+        keywords: ['background', 'hide', 'show', 'splash'],
         run: () => updatePrefs({ enabled: !$prefs.get().enabled })
       }
     })
@@ -1245,7 +1310,7 @@ export default {
     if (typeof ctx.registerSettingsPage === 'function') {
       ctx.registerSettingsPage({
         id: 'settings',
-        title: 'Stagehand',
+        title: NAME,
         icon: 'symbol-color',
         render: () => jsx(SettingsPanel, {})
       })
