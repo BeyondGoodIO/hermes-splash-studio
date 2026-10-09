@@ -1,6 +1,6 @@
 // Headless tests for Splash Studio: jsdom + real React, with a stubbed Hermes plugin SDK.
-// Run with `npm test` (Node 20+). The plugin itself has no dependencies; these are dev-only.
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+// Run with `npm test` (Node 20.19+, 22.13+ or 24+). The plugin itself has no dependencies; these are dev-only.
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -249,6 +249,10 @@ await test('reset needs two clicks and restores defaults', async () => {
   await act(async () => { reset().click() })
   assert.equal(storage.get('prefs').strength, 34)
   assert.deepEqual(storage.get('prefs').prompts.length, 3)
+  assert.deepEqual(storage.get('prefs').title, { show: true, tagline: true, text: '', family: 'stock', customFamily: '', size: 0, color: '', glow: false })
+  const urlInput = [...host.querySelectorAll('input')].find(i => (i.placeholder || '').startsWith('https://'))
+  assert.equal(urlInput.value, '')
+  assert.ok(!host.textContent.includes('Use an https:// image address.'))
 })
 
 await test('dispose cleans everything', async () => {
@@ -264,6 +268,50 @@ await test('dispose cleans everything', async () => {
   assert.equal(b3.querySelector('.sh-art'), null, 'stage came back after dispose')
 })
 
+// Migration edge cases, each with a fresh register() of the same module.
+async function freshRegister(storageImpl) {
+  regs.length = 0
+  const c = { ...ctx, storage: storageImpl }
+  let dispose = null
+  c.onDispose = f => { dispose = f }
+  plugin.register(c)
+  await tick(60)
+  dispose()
+}
+const tinyImage = 'data:image/png;base64,iVBORw0KGgo='
+
+await test('migration: image-only moves and shows; unreadable old prefs do not block it', async () => {
+  w.localStorage.clear()
+  w.localStorage.setItem(scoped('stagehand', 'image'), JSON.stringify(tinyImage))
+  w.localStorage.setItem(scoped('stagehand', 'prefs'), '{not json')
+  await freshRegister(storage)
+  assert.equal(storage.get('image'), tinyImage)
+  assert.equal(w.localStorage.getItem(scoped('stagehand', 'image')), null)
+  assert.equal(w.localStorage.getItem(scoped('stagehand', 'prefs')), null, 'unreadable prefs left behind')
+})
+
+await test('migration: image-only with no old prefs selects My image', async () => {
+  w.localStorage.clear()
+  w.localStorage.setItem(scoped('stagehand', 'image'), JSON.stringify(tinyImage))
+  await freshRegister(storage)
+  assert.equal(storage.get('prefs').imagery, 'custom')
+})
+
+await test('migration: a failed image write keeps the old copy and retries next start', async () => {
+  w.localStorage.clear()
+  w.localStorage.setItem(scoped('stagehand', 'image'), JSON.stringify(tinyImage))
+  w.localStorage.setItem(scoped('stagehand', 'prefs'), JSON.stringify({ strength: 40 }))
+  const full = { ...storage, set: (k, v) => { if (k !== 'image') storage.set(k, v) } }
+  await freshRegister(full)
+  assert.ok(w.localStorage.getItem(scoped('stagehand', 'image')), 'old image deleted after failed copy')
+  assert.equal(storage.get('prefs').strength, 40)
+  await freshRegister(storage)
+  assert.equal(storage.get('image'), tinyImage, 'image not moved on retry')
+  assert.equal(w.localStorage.getItem(scoped('stagehand', 'image')), null)
+  assert.equal(storage.get('prefs').strength, 40)
+})
+
 for (const r of results) console.log(r.join(' | '))
+rmSync(work, { recursive: true, force: true })
 console.log(`\n${results.filter(r => r[0] === 'PASS').length}/${results.length} passed`)
 process.exit(process.exitCode || 0)

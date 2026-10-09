@@ -21,7 +21,9 @@ Ongoing chats are never touched. Turn Splash Studio off and everything goes back
 2. Hermes picks it up within a few seconds. If it doesn't, press Cmd+K and run **Reload desktop plugins**.
 3. Open a new chat to see it. To customize, open **Settings > Plugins > Splash Studio**, or press Cmd+K and run **Customize Splash Studio**.
 
-To update, run `git pull` in that folder, or replace `plugin.js` with the new one.
+To update, run `git pull` in that folder, or replace `plugin.js` with the new one. If you also use Hermes's in-app **Install from Git**, it names the folder `hermes-splash-studio` instead. That works too, as long as you only keep one copy.
+
+If you tried the pre-release version called Stagehand, delete `~/.hermes/desktop-plugins/stagehand`. Splash Studio carries your settings over on first start.
 
 ## Use
 

@@ -96,6 +96,9 @@ let pluginCtx = null
 const $prefs = atom({ ...DEFAULTS, widgets: { ...DEFAULTS.widgets }, prompts: DEFAULTS.prompts.slice() })
 const $hasImage = atom(false)
 const $imageError = atom('')
+// Bumped on reset so the settings form remounts with no leftover drafts or notes.
+const $resetCount = atom(0)
+let legacyTimer = null
 
 const stages = new Map()
 let styleEl = null
@@ -918,6 +921,7 @@ function SettingsPanel() {
   const prefs = useValue($prefs)
   const hasImage = useValue($hasImage)
   const imageError = useValue($imageError)
+  const resetCount = useValue($resetCount)
 
   const pickFile = () => {
     const input = document.createElement('input')
@@ -1013,7 +1017,7 @@ function SettingsPanel() {
               jsx(Button, { type: 'button', variant: 'ghost', onClick: clearImage, disabled: !hasImage, children: 'Clear saved image' })
             ]
           }),
-          jsx(ImageUrlField, { value: prefs.customUrl }),
+          jsx(ImageUrlField, { value: prefs.customUrl }, `url-${resetCount}`),
           imageError ? jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: imageError }) : null
         ]
       }),
@@ -1204,22 +1208,64 @@ function StatusChip() {
   })
 }
 
-// One-time carry-over of settings saved under the pre-release id. The new copy is written
-// and verified before the old one is removed, so a full storage never loses the image.
+// One-time carry-over of settings saved under the pre-release id. Each key is handled on
+// its own: the new copy is written and verified before the old one is removed, so a full
+// storage never loses the image, and a failed or unreadable key never blocks the other.
+// The image goes first because it's the large one most likely to hit the storage quota.
 function migrateLegacy(ctx) {
+  let store = null
   try {
-    if (ctx.storage.get('prefs', undefined) !== undefined) return
-    const store = window.localStorage
-    const base = `hermes.plugin.${LEGACY_ID}.`
-    for (const key of ['prefs', 'image']) {
+    store = window.localStorage
+  } catch {
+    return
+  }
+  if (!store) return
+  const base = `hermes.plugin.${LEGACY_ID}.`
+  let movedImage = false
+  let hadOldPrefs = false
+
+  for (const key of ['image', 'prefs']) {
+    try {
       const raw = store.getItem(base + key)
       if (raw === null) continue
-      const value = JSON.parse(raw)
+      if (key === 'prefs') hadOldPrefs = true
+      // Already set under the new id: the old copy is redundant.
+      if (ctx.storage.get(key, undefined) !== undefined) {
+        store.removeItem(base + key)
+        continue
+      }
+      let value
+      try {
+        value = JSON.parse(raw)
+      } catch {
+        store.removeItem(base + key)
+        continue
+      }
       ctx.storage.set(key, value)
-      if (JSON.stringify(ctx.storage.get(key, null)) === JSON.stringify(value)) store.removeItem(base + key)
+      if (JSON.stringify(ctx.storage.get(key, null)) === JSON.stringify(value)) {
+        store.removeItem(base + key)
+        if (key === 'image') movedImage = true
+      }
+      // Otherwise the write didn't stick (storage full); leave the old copy for next time.
+    } catch {
+      // Storage unavailable for this key; try again on the next start.
     }
-  } catch {
-    // Nothing to carry over, or storage unavailable: start from defaults.
+  }
+
+  // An image with no saved settings should still show up.
+  if (movedImage && !hadOldPrefs && ctx.storage.get('prefs', undefined) === undefined) {
+    ctx.storage.set('prefs', { imagery: 'custom' })
+  }
+}
+
+// The pre-release build drawing on the same screen would fight with this one.
+function warnIfLegacyRunning() {
+  if (disposed) return
+  if (document.getElementById(`${LEGACY_ID}-css`) || document.documentElement.hasAttribute(`data-${LEGACY_ID}`)) {
+    host.notify?.({
+      kind: 'info',
+      message: `An older copy of this plugin (Stagehand) is still installed. Delete ~/.hermes/desktop-plugins/${LEGACY_ID} so the two don't overlap.`
+    })
   }
 }
 
@@ -1231,6 +1277,8 @@ function resetPrefs() {
     title: { ...DEFAULTS.title }
   })
   failedUrls.clear()
+  $imageError.set('')
+  $resetCount.set($resetCount.get() + 1)
 }
 
 function ResetButton() {
@@ -1332,6 +1380,8 @@ export default {
       observer = null
       clearTimeout(syncTimer)
       clearTimeout(clockTimer)
+      clearTimeout(legacyTimer)
+      legacyTimer = null
       syncTimer = null
       clockTimer = null
       for (const bounds of [...stages.keys()]) dropStage(bounds)
@@ -1343,5 +1393,7 @@ export default {
     installWatcher()
     scheduleSync()
     scheduleClock()
+    clearTimeout(legacyTimer)
+    legacyTimer = setTimeout(warnIfLegacyRunning, 3000)
   }
 }

@@ -13,7 +13,7 @@
     "test": "node --check plugin.js && node test/plugin.test.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
   },
   "devDependencies": {
     "jsdom": "^29.1.1",
