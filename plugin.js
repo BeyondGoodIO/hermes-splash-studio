@@ -5,10 +5,10 @@
  * - Side widgets: clock + greeting, profile and model, recent chats, starter prompts
  * - The big title: rewrite it, restyle it (font, size, color), or hide it
  *
- * Install: copy this folder to ~/.hermes/desktop-plugins/stagehand
- * then run "Reload desktop plugins" from the command palette (Cmd+K).
+ * Install: copy this folder to ~/.hermes/desktop-plugins/stagehand.
+ * The app picks it up within a few seconds (fallback: Cmd+K, "Reload desktop plugins").
  * Plain ESM, no build step. Ongoing chats are never touched.
- * v2.0.0
+ * v2.1.0
  */
 
 import {
@@ -24,6 +24,7 @@ import {
   pluginSettingsHref,
   useValue
 } from '@hermes/plugin-sdk'
+import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'stagehand'
@@ -31,6 +32,8 @@ const STYLE_ID = 'stagehand-css'
 const TITLE_STYLE_ID = 'stagehand-title-css'
 const TITLE_ATTR = 'data-stagehand'
 const MAX_IMAGE_CHARS = 900_000
+const MAX_PROMPTS = 3
+const INTRO = '[data-slot="aui_intro"]'
 
 const DEFAULT_PROMPTS = [
   "What's the next concrete step?",
@@ -97,12 +100,16 @@ let titleStyleEl = null
 let observer = null
 let clockTimer = null
 let syncTimer = null
+let disposed = false
 let sessionsCache = { at: 0, rows: [] }
 let sessionsInflight = null
 
 function promptLines(prompts, keepBlank) {
-  const lines = (Array.isArray(prompts) ? prompts : DEFAULT_PROMPTS).map(line => String(line ?? '').trim()).slice(0, 6)
-  return keepBlank ? lines : lines.filter(Boolean)
+  // While editing (keepBlank) keep lines verbatim so trailing spaces survive typing.
+  const lines = (Array.isArray(prompts) ? prompts : DEFAULT_PROMPTS)
+    .map(line => String(line ?? '').slice(0, 200))
+    .slice(0, MAX_PROMPTS)
+  return keepBlank ? lines : lines.map(line => line.trim()).filter(Boolean)
 }
 
 function clonePrefs(value, keepBlankPrompts = false) {
@@ -163,7 +170,8 @@ function safeImageUrl(value) {
   if (/^data:image\/(png|jpeg|jpg|webp|gif|avif);base64,/i.test(text)) return text
   try {
     const url = new URL(text)
-    if (url.protocol === 'https:' || url.protocol === 'http:') return url.href
+    // https only: no plain-http fetches, no file: or other schemes.
+    if (url.protocol === 'https:') return url.href
   } catch {
     return ''
   }
@@ -172,7 +180,8 @@ function safeImageUrl(value) {
 
 function token(name) {
   if (typeof getComputedStyle !== 'function') return ''
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  // Theme values are interpolated into SVG attributes; keep them attribute-safe.
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim().replace(/["'<>&]/g, '')
 }
 
 function palette() {
@@ -270,8 +279,12 @@ function ensureStyle() {
         radial-gradient(ellipse at center, var(--ui-chat-surface-background) 0%, color-mix(in srgb, var(--ui-chat-surface-background) 72%, transparent) 38%, transparent 68%),
         linear-gradient(to top, var(--ui-chat-surface-background), transparent 28%);
     }
-    .sh-widgets {
-      z-index: 8;
+    /* .sh-widgets is the size container; the grid lives one level down so the
+       container query below can actually restyle it (a container can't query itself). */
+    .sh-widgets { z-index: 8; container-type: inline-size; }
+    .sh-grid {
+      height: 100%;
+      box-sizing: border-box;
       display: grid;
       grid-template-columns: minmax(9rem, 1fr) min(var(--composer-width, 42rem), 100%) minmax(9rem, 1fr);
       grid-template-rows: auto minmax(0, 1fr) auto;
@@ -329,10 +342,15 @@ function ensureStyle() {
     }
     .sh-link:hover { color: var(--foreground); }
     @container (max-width: 860px) {
-      .sh-widgets { grid-template-columns: 1fr; }
-      .sh-meta, .sh-recents, .sh-prompts { grid-column: 1; justify-self: start; text-align: left; }
+      .sh-grid { grid-template-columns: 1fr; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+      .sh-clock, .sh-meta, .sh-recents, .sh-prompts { grid-column: 1; justify-self: start; text-align: left; }
+      .sh-clock { grid-row: 1; }
       .sh-meta { grid-row: 2; }
+      .sh-prompts { grid-row: 4; }
       .sh-recents { display: none; }
+    }
+    @container (max-width: 560px) {
+      .sh-meta, .sh-prompts { display: none; }
     }
   `
   document.documentElement.appendChild(styleEl)
@@ -554,7 +572,7 @@ function fillCard(card, prefs, rows) {
     card.hidden = false
     return
   }
-  const prompts = prefs.prompts.filter(Boolean).slice(0, 3)
+  const prompts = prefs.prompts.map(line => line.trim()).filter(Boolean).slice(0, MAX_PROMPTS)
   if (card.dataset.role === 'prompts' && prefs.widgets.prompts && prompts.length) {
     card.append(el('div', 'sh-kicker', 'Start with'))
     const list = el('div', 'sh-list')
@@ -611,7 +629,7 @@ function ensureStage(bounds) {
   const art = el('div', 'sh-art')
   art.setAttribute('aria-hidden', 'true')
   const widgets = el('div', 'sh-widgets')
-  widgets.style.containerType = 'inline-size'
+  const grid = el('div', 'sh-grid')
   const clock = el('div', 'sh-card sh-clock')
   const meta = el('div', 'sh-card sh-meta')
   const recents = el('div', 'sh-card sh-recents')
@@ -621,9 +639,12 @@ function ensureStage(bounds) {
   recents.dataset.role = 'recents'
   prompts.dataset.role = 'prompts'
   for (const card of [clock, meta, recents, prompts]) card.hidden = true
-  widgets.append(clock, meta, recents, prompts)
+  grid.append(clock, meta, recents, prompts)
+  widgets.append(grid)
   bounds.prepend(art)
   bounds.append(widgets)
+  // A freshly shown new-chat screen should list current chats, not a cached list.
+  sessionsCache.at = 0
   record = { art, widgets, clock, meta, recents, prompts, signature: '' }
   stages.set(bounds, record)
   return record
@@ -658,7 +679,7 @@ async function refreshStage(bounds, prefs) {
     return
   }
   const rows = prefs.widgets.recents ? await loadSessions() : []
-  if (generation !== record.generation) return
+  if (disposed || generation !== record.generation) return
   if (!bounds.isConnected || !bounds.querySelector('[data-slot="aui_intro"]')) {
     dropStage(bounds)
     return
@@ -682,16 +703,18 @@ function tickClock(record) {
 }
 
 function syncStages() {
-  if (!document.body) return
-  syncTitle()
+  if (disposed || !document.body) return
   const prefs = $prefs.get()
   if (!prefs.enabled) {
+    // Off means fully off: imagery, widgets and title changes all go away.
     for (const bounds of [...stages.keys()]) dropStage(bounds)
+    removeTitle()
     return
   }
+  syncTitle()
   ensureStyle()
   const live = new Set()
-  for (const intro of document.querySelectorAll('[data-slot="aui_intro"]')) {
+  for (const intro of document.querySelectorAll(INTRO)) {
     const bounds = intro.closest('[data-slot="composer-bounds"]') || intro.closest('[data-chat-surface]')
     if (!bounds) continue
     live.add(bounds)
@@ -710,12 +733,44 @@ function scheduleSync() {
   }, 40)
 }
 
+// Only wake up for changes that can matter to the new-chat screen. Streaming replies in
+// ongoing chats mutate the DOM constantly; those batches must cost a few cheap checks, not a resync.
+function mutationsMatter(records) {
+  for (const record of records) {
+    if (record.type === 'attributes') return true
+    for (const node of record.addedNodes) {
+      if (node.nodeType !== 1) continue
+      if (node.closest?.('.sh-widgets, .sh-art')) continue
+      if (node.matches?.(INTRO) || node.querySelector?.(INTRO)) return true
+    }
+    if (record.removedNodes.length && stages.size) {
+      for (const bounds of stages.keys()) {
+        if (!bounds.isConnected || !bounds.querySelector(INTRO)) return true
+      }
+    }
+  }
+  return false
+}
+
 function installWatcher() {
   if (observer || !document.body) return
-  observer = new MutationObserver(scheduleSync)
-  observer.observe(document.body, { characterData: true, childList: true, subtree: true })
+  observer = new MutationObserver(records => {
+    if (mutationsMatter(records)) scheduleSync()
+  })
+  observer.observe(document.body, { childList: true, subtree: true })
   const themeRoot = document.documentElement
-  observer.observe(themeRoot, { attributes: true, attributeFilter: ['class', 'data-hermes-theme'] })
+  observer.observe(themeRoot, { attributes: true, attributeFilter: ['class', 'data-hermes-theme', 'data-hermes-mode', 'style'] })
+}
+
+function scheduleClock() {
+  clearTimeout(clockTimer)
+  if (disposed) return
+  const now = new Date()
+  const wait = 60_000 - (now.getSeconds() * 1000 + now.getMilliseconds()) + 50
+  clockTimer = setTimeout(() => {
+    for (const record of stages.values()) tickClock(record)
+    scheduleClock()
+  }, wait)
 }
 
 function compressImage(file) {
@@ -816,7 +871,7 @@ function SettingsPanel() {
           jsxs('div', {
             children: [
               jsx('div', { className: 'text-(--ui-text-primary)', children: 'Show on new chats' }),
-              jsx('p', { className: 'm-0 mt-1 text-xs text-(--ui-text-tertiary)', children: 'Imagery and widgets appear only on the empty new-chat screen. Ongoing chats stay plain.' })
+              jsx('p', { className: 'm-0 mt-1 text-xs text-(--ui-text-tertiary)', children: 'Imagery, widgets and title changes appear only on the empty new-chat screen. Ongoing chats stay plain. Turning this off puts everything back to stock.' })
             ]
           }),
           jsx(Switch, { checked: prefs.enabled, onCheckedChange: enabled => updatePrefs({ enabled }) })
@@ -863,11 +918,7 @@ function SettingsPanel() {
               jsx(Button, { type: 'button', variant: 'ghost', onClick: clearImage, disabled: !hasImage, children: 'Clear saved image' })
             ]
           }),
-          jsx(Input, {
-            placeholder: 'https://… image URL',
-            value: prefs.customUrl,
-            onChange: event => updatePrefs({ customUrl: event.target.value, imagery: 'custom' })
-          }),
+          jsx(ImageUrlField, { value: prefs.customUrl }),
           imageError ? jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: imageError }) : null
         ]
       }),
@@ -886,7 +937,7 @@ function SettingsPanel() {
             value: prefs.prompts.join('\n'),
             onChange: event => updatePrefs({ prompts: event.target.value.split(/\n/) })
           }),
-          jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: 'One starter prompt per line. Clicking one fills the new-chat composer. It does not send.' })
+          jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: 'Up to three starter prompts, one per line. Clicking one fills the new-chat composer. It does not send.' })
         ]
       }),
       jsx(Button, {
@@ -897,6 +948,56 @@ function SettingsPanel() {
           host.notify?.({ kind: 'info', message: 'Intro splash is on. Open a new chat to see the stage.' })
         },
         children: 'Make sure the new-chat splash is on'
+      })
+    ]
+  })
+}
+
+// The URL is applied only when you finish typing (Enter or leaving the field), so a
+// half-typed address never switches imagery or triggers a network request.
+function ImageUrlField({ value }) {
+  const [draft, setDraft] = useState(value)
+  const [note, setNote] = useState('')
+
+  useEffect(() => {
+    setDraft(value)
+  }, [value])
+
+  const commit = () => {
+    const text = draft.trim()
+    if (text === value) return
+    if (!text) {
+      setNote('')
+      updatePrefs({ customUrl: '' })
+      return
+    }
+    const safe = safeImageUrl(text)
+    if (!safe || safe.startsWith('data:')) {
+      setNote('Use an https:// image address.')
+      return
+    }
+    setNote('')
+    updatePrefs({ customUrl: safe, imagery: 'custom' })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsx(Input, {
+        placeholder: 'https://… image URL (press Enter to use it)',
+        value: draft,
+        onChange: event => setDraft(event.target.value),
+        onBlur: commit,
+        onKeyDown: event => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            commit()
+          }
+        }
+      }),
+      jsx('p', {
+        className: 'm-0 text-xs text-(--ui-text-tertiary)',
+        children: note || 'A URL image is downloaded from that site each time a new chat opens. A saved local image is used first if you have one.'
       })
     ]
   })
@@ -1004,6 +1105,8 @@ export default {
   name: 'Stagehand',
   register(ctx) {
     pluginCtx = ctx
+    disposed = false
+    sessionsCache = { at: 0, rows: [] }
     const stored = ctx.storage.get('prefs', {})
     $prefs.set(clonePrefs(stored && typeof stored === 'object' ? stored : {}))
     $hasImage.set(Boolean(safeImageUrl(ctx.storage.get('image', ''))))
@@ -1048,12 +1151,14 @@ export default {
 
     const unsub = $prefs.subscribe(() => scheduleSync())
     ctx.onDispose(() => {
+      disposed = true
       unsub()
       observer?.disconnect()
       observer = null
       clearTimeout(syncTimer)
-      clearInterval(clockTimer)
+      clearTimeout(clockTimer)
       syncTimer = null
+      clockTimer = null
       for (const bounds of [...stages.keys()]) dropStage(bounds)
       removeStyle()
       removeTitle()
@@ -1062,8 +1167,6 @@ export default {
 
     installWatcher()
     scheduleSync()
-    clockTimer = setInterval(() => {
-      for (const record of stages.values()) tickClock(record)
-    }, 30_000)
+    scheduleClock()
   }
 }
