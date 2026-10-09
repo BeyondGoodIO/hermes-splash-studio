@@ -1,0 +1,1069 @@
+/**
+ * Stagehand: dress the empty new-chat screen in the Hermes desktop app.
+ *
+ * - Imagery behind the splash (presets or your own image)
+ * - Side widgets: clock + greeting, profile and model, recent chats, starter prompts
+ * - The big title: rewrite it, restyle it (font, size, color), or hide it
+ *
+ * Install: copy this folder to ~/.hermes/desktop-plugins/stagehand
+ * then run "Reload desktop plugins" from the command palette (Cmd+K).
+ * Plain ESM, no build step. Ongoing chats are never touched.
+ * v2.0.0
+ */
+
+import {
+  Button,
+  Input,
+  Switch,
+  Textarea,
+  Tip,
+  atom,
+  cn,
+  haptic,
+  host,
+  pluginSettingsHref,
+  useValue
+} from '@hermes/plugin-sdk'
+import { jsx, jsxs } from 'react/jsx-runtime'
+
+const ID = 'stagehand'
+const STYLE_ID = 'stagehand-css'
+const TITLE_STYLE_ID = 'stagehand-title-css'
+const TITLE_ATTR = 'data-stagehand'
+const MAX_IMAGE_CHARS = 900_000
+
+const DEFAULT_PROMPTS = [
+  "What's the next concrete step?",
+  'Look at what I left unfinished and pick one thing.',
+  'Sketch a plan before changing anything.'
+]
+
+const IMAGERY = [
+  { id: 'atelier', label: 'Atelier' },
+  { id: 'horizon', label: 'Horizon' },
+  { id: 'window', label: 'Window' },
+  { id: 'paper', label: 'Paper' },
+  { id: 'stars', label: 'Stars' },
+  { id: 'custom', label: 'My image' }
+]
+
+const DEFAULTS = {
+  enabled: true,
+  imagery: 'atelier',
+  customUrl: '',
+  strength: 34,
+  widgets: {
+    clock: true,
+    greeting: true,
+    model: true,
+    recents: true,
+    prompts: true
+  },
+  prompts: DEFAULT_PROMPTS.slice(),
+  title: {
+    show: true,
+    tagline: true,
+    text: '', // '' = the stock title
+    family: 'stock', // stock | serif | sans | mono | custom
+    customFamily: '',
+    size: 0, // px; 0 = auto-fit to the column (stock behavior)
+    color: '', // '' = theme color
+    glow: false // soft accent-colored glow behind the title area
+  }
+}
+
+const TITLE_FAMILIES = {
+  serif: "'Source Serif Pro', 'Source Serif 4', Charter, 'Iowan Old Style', Georgia, serif",
+  sans: "-apple-system, 'Helvetica Neue', Arial, sans-serif",
+  mono: "ui-monospace, 'SF Mono', Menlo, monospace"
+}
+
+const FAMILY_OPTIONS = [
+  { id: 'stock', label: 'Stock' },
+  { id: 'serif', label: 'Serif' },
+  { id: 'sans', label: 'Sans' },
+  { id: 'mono', label: 'Mono' },
+  { id: 'custom', label: 'Custom' }
+]
+
+let pluginCtx = null
+const $prefs = atom({ ...DEFAULTS, widgets: { ...DEFAULTS.widgets }, prompts: DEFAULTS.prompts.slice() })
+const $hasImage = atom(false)
+const $imageError = atom('')
+
+const stages = new Map()
+let styleEl = null
+let titleStyleEl = null
+let observer = null
+let clockTimer = null
+let syncTimer = null
+let sessionsCache = { at: 0, rows: [] }
+let sessionsInflight = null
+
+function promptLines(prompts, keepBlank) {
+  const lines = (Array.isArray(prompts) ? prompts : DEFAULT_PROMPTS).map(line => String(line ?? '').trim()).slice(0, 6)
+  return keepBlank ? lines : lines.filter(Boolean)
+}
+
+function clonePrefs(value, keepBlankPrompts = false) {
+  const widgets = value && value.widgets && typeof value.widgets === 'object' ? value.widgets : {}
+
+  return {
+    enabled: value && value.enabled !== false,
+    imagery: IMAGERY.some(item => item.id === value?.imagery) ? value.imagery : DEFAULTS.imagery,
+    customUrl: typeof value?.customUrl === 'string' ? value.customUrl : '',
+    strength: clampStrength(value?.strength),
+    widgets: {
+      clock: widgets.clock !== false,
+      greeting: widgets.greeting !== false,
+      model: widgets.model !== false,
+      recents: widgets.recents !== false,
+      prompts: widgets.prompts !== false
+    },
+    prompts: promptLines(value?.prompts, keepBlankPrompts),
+    title: cloneTitle(value?.title)
+  }
+}
+
+function sanitizeFamily(value) {
+  // A font stack only: no braces, semicolons, url() or @import, so it cannot break out of its rule.
+  return String(value || '').replace(/[{};<>\\]|url\(|@import/gi, '').slice(0, 200)
+}
+
+function sanitizeColor(value) {
+  return /^#[0-9a-f]{3,8}$/i.test(String(value || '')) ? String(value) : ''
+}
+
+function cloneTitle(value) {
+  const t = value && typeof value === 'object' ? value : {}
+  const d = DEFAULTS.title
+  const size = Number(t.size)
+
+  return {
+    show: t.show !== false,
+    tagline: t.tagline !== false,
+    text: typeof t.text === 'string' ? t.text.slice(0, 60) : d.text,
+    family: FAMILY_OPTIONS.some(item => item.id === t.family) ? t.family : d.family,
+    customFamily: typeof t.customFamily === 'string' ? sanitizeFamily(t.customFamily) : '',
+    size: Number.isFinite(size) ? Math.min(240, Math.max(0, Math.round(size))) : 0,
+    color: sanitizeColor(t.color),
+    glow: t.glow === true
+  }
+}
+
+function clampStrength(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return DEFAULTS.strength
+  return Math.min(70, Math.max(8, Math.round(number)))
+}
+
+function safeImageUrl(value) {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  if (/^data:image\/(png|jpeg|jpg|webp|gif|avif);base64,/i.test(text)) return text
+  try {
+    const url = new URL(text)
+    if (url.protocol === 'https:' || url.protocol === 'http:') return url.href
+  } catch {
+    return ''
+  }
+  return ''
+}
+
+function token(name) {
+  if (typeof getComputedStyle !== 'function') return ''
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+}
+
+function palette() {
+  return {
+    accent: token('--ui-accent') || token('--accent') || 'CanvasText',
+    fg: token('--foreground') || token('--ui-text-primary') || 'CanvasText',
+    bg: token('--ui-chat-surface-background') || token('--background') || 'Canvas'
+  }
+}
+
+function svgUrl(markup) {
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(markup)}`
+}
+
+function imageryMarkup(id) {
+  const { accent, fg, bg } = palette()
+  const common = `xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice"`
+
+  if (id === 'horizon') {
+    return `<svg ${common}><rect width="1600" height="1000" fill="${bg}"/><rect width="1600" height="1000" fill="${accent}" opacity="0.22"/><path d="M0 760 C 280 680 420 820 720 740 C 980 670 1180 800 1600 700 L 1600 1000 L 0 1000 Z" fill="${bg}" opacity="0.72"/><path d="M0 820 C 240 760 520 880 860 800 C 1120 740 1360 860 1600 790 L 1600 1000 L 0 1000 Z" fill="${fg}" opacity="0.08"/><circle cx="1180" cy="280" r="78" fill="${accent}" opacity="0.55"/></svg>`
+  }
+
+  if (id === 'window') {
+    return `<svg ${common}><rect width="1600" height="1000" fill="${bg}"/><rect x="180" y="90" width="1240" height="760" rx="18" fill="${accent}" opacity="0.16"/><rect x="220" y="130" width="1160" height="680" fill="${bg}" opacity="0.35"/><path d="M800 130 V 810 M 220 470 H 1380" stroke="${fg}" stroke-width="10" opacity="0.18"/><circle cx="800" cy="390" r="90" fill="${accent}" opacity="0.45"/></svg>`
+  }
+
+  if (id === 'paper') {
+    return `<svg ${common}><rect width="1600" height="1000" fill="${bg}"/><g stroke="${fg}" stroke-width="1" opacity="0.14">${Array.from({ length: 18 }, (_, i) => `<line x1="80" x2="1520" y1="${120 + i * 42}" y2="${120 + i * 42}"/>`).join('')}</g><circle cx="1320" cy="210" r="54" fill="none" stroke="${accent}" stroke-width="6" opacity="0.7"/><circle cx="1320" cy="210" r="8" fill="${accent}" opacity="0.8"/></svg>`
+  }
+
+  if (id === 'stars') {
+    const dots = [
+      [180, 160], [420, 90], [260, 340], [640, 220], [900, 120], [1100, 280],
+      [1380, 160], [1240, 420], [760, 480], [480, 620], [200, 700], [980, 640],
+      [1460, 700], [700, 80], [1040, 520]
+    ]
+    const lines = [[0, 1], [1, 3], [3, 4], [4, 5], [5, 6], [3, 8], [8, 9], [2, 10], [7, 12]]
+    return `<svg ${common}><rect width="1600" height="1000" fill="${bg}"/><g stroke="${accent}" stroke-width="1.5" opacity="0.35">${lines.map(([a, b]) => `<line x1="${dots[a][0]}" y1="${dots[a][1]}" x2="${dots[b][0]}" y2="${dots[b][1]}"/>`).join('')}</g><g fill="${fg}">${dots.map(([x, y], i) => `<circle cx="${x}" cy="${y}" r="${i % 4 === 0 ? 4.5 : 2.4}" opacity="${i % 3 === 0 ? 0.7 : 0.4}"/>`).join('')}</g></svg>`
+  }
+
+  return `<svg ${common}><rect width="1600" height="1000" fill="${bg}"/><circle cx="1240" cy="220" r="220" fill="${accent}" opacity="0.28"/><circle cx="1240" cy="220" r="90" fill="${accent}" opacity="0.35"/><path d="M120 860 C 360 640 520 920 860 700 C 1120 540 1280 820 1540 620" fill="none" stroke="${fg}" stroke-width="3" opacity="0.22"/><rect x="96" y="96" width="1408" height="808" fill="none" stroke="${fg}" stroke-width="2" opacity="0.12"/></svg>`
+}
+
+function artUrl(prefs) {
+  if (prefs.imagery === 'custom') {
+    const stored = pluginCtx ? safeImageUrl(pluginCtx.storage.get('image', '')) : ''
+    const remote = safeImageUrl(prefs.customUrl)
+    return stored || remote
+  }
+  return svgUrl(imageryMarkup(prefs.imagery))
+}
+
+function cssUrl(value) {
+  return `url("${String(value).replace(/["\\\n\r]/g, '')}")`
+}
+
+function greeting(date = new Date()) {
+  const hour = date.getHours()
+  if (hour < 5) return 'Still up'
+  if (hour < 12) return 'Good morning'
+  if (hour < 17) return 'Good afternoon'
+  return 'Good evening'
+}
+
+function clockParts(date = new Date()) {
+  return {
+    time: date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+    date: date.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })
+  }
+}
+
+function modelLabel() {
+  const model = host.state && host.state.model ? String(host.state.model.get() || '') : ''
+  const slash = model.lastIndexOf('/')
+  return (slash >= 0 ? model.slice(slash + 1) : model) || 'model'
+}
+
+function profileLabel() {
+  const profile = host.state && host.state.profile ? String(host.state.profile.get() || '') : ''
+  return profile || 'profile'
+}
+
+function ensureStyle() {
+  if (styleEl && styleEl.isConnected) return
+  styleEl = document.createElement('style')
+  styleEl.id = STYLE_ID
+  styleEl.textContent = `
+    .sh-art, .sh-widgets { position: absolute; inset: 0; pointer-events: none; }
+    .sh-art { z-index: -1; background-position: center; background-size: cover; background-repeat: no-repeat; }
+    .sh-art::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(ellipse at center, var(--ui-chat-surface-background) 0%, color-mix(in srgb, var(--ui-chat-surface-background) 72%, transparent) 38%, transparent 68%),
+        linear-gradient(to top, var(--ui-chat-surface-background), transparent 28%);
+    }
+    .sh-widgets {
+      z-index: 8;
+      display: grid;
+      grid-template-columns: minmax(9rem, 1fr) min(var(--composer-width, 42rem), 100%) minmax(9rem, 1fr);
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      gap: 0.75rem;
+      padding: 0.85rem;
+      padding-bottom: calc(var(--composer-measured-height, 7.5rem) + 0.85rem);
+    }
+    .sh-card {
+      pointer-events: auto;
+      max-width: 16rem;
+      border: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent);
+      background: color-mix(in srgb, var(--ui-chat-surface-background) 82%, transparent);
+      color: var(--ui-text-secondary);
+      border-radius: 0.7rem;
+      padding: 0.65rem 0.75rem;
+      text-align: left;
+    }
+    .sh-clock { grid-column: 1; grid-row: 1; justify-self: start; }
+    .sh-meta { grid-column: 3; grid-row: 1; justify-self: end; text-align: right; }
+    .sh-recents { grid-column: 1; grid-row: 3; justify-self: start; align-self: end; }
+    .sh-prompts { grid-column: 3; grid-row: 3; justify-self: end; align-self: end; }
+    .sh-kicker { font-size: 0.68rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ui-text-tertiary); }
+    .sh-time { margin-top: 0.1rem; font-size: 1.35rem; line-height: 1.1; color: var(--ui-text-primary, var(--foreground)); }
+    .sh-sub { margin-top: 0.15rem; font-size: 0.75rem; color: var(--ui-text-tertiary); }
+    .sh-list { display: flex; flex-direction: column; gap: 0.28rem; margin-top: 0.4rem; }
+    .sh-btn {
+      pointer-events: auto;
+      display: block;
+      width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      border: 0;
+      border-radius: 0.4rem;
+      background: transparent;
+      color: var(--ui-text-secondary);
+      font: inherit;
+      font-size: 0.75rem;
+      line-height: 1.3;
+      text-align: inherit;
+      padding: 0.2rem 0.15rem;
+      cursor: pointer;
+    }
+    .sh-btn:hover { color: var(--foreground); background: var(--chrome-action-hover); }
+    .sh-link {
+      pointer-events: auto;
+      margin-top: 0.45rem;
+      border: 0;
+      background: transparent;
+      color: var(--ui-text-tertiary);
+      font: inherit;
+      font-size: 0.68rem;
+      cursor: pointer;
+      padding: 0;
+    }
+    .sh-link:hover { color: var(--foreground); }
+    @container (max-width: 860px) {
+      .sh-widgets { grid-template-columns: 1fr; }
+      .sh-meta, .sh-recents, .sh-prompts { grid-column: 1; justify-self: start; text-align: left; }
+      .sh-meta { grid-row: 2; }
+      .sh-recents { display: none; }
+    }
+  `
+  document.documentElement.appendChild(styleEl)
+}
+
+function removeStyle() {
+  styleEl?.remove()
+  styleEl = null
+}
+
+const TITLE_MARK = "[data-slot='aui_intro'] .wordmark"
+
+function titleCss(t) {
+  const html = `html[${TITLE_ATTR}]`
+  const mark = `${html} ${TITLE_MARK}`
+  const tag = `${html} [data-slot='aui_intro'] p:last-child`
+  const out = []
+
+  if (!t.show) {
+    out.push(`${mark} { display: none !important; }`)
+  } else {
+    const rules = []
+
+    if (t.family !== 'stock') {
+      const stack = t.family === 'custom' ? sanitizeFamily(t.customFamily) || TITLE_FAMILIES.serif : TITLE_FAMILIES[t.family]
+      rules.push(
+        `font-family: ${stack} !important`,
+        'font-weight: 600 !important',
+        'text-transform: none !important',
+        'letter-spacing: -0.01em !important',
+        'line-height: 1 !important',
+        'mix-blend-mode: normal !important'
+      )
+    }
+
+    const color = sanitizeColor(t.color)
+
+    if (color) {
+      rules.push(`color: ${color} !important`, 'mix-blend-mode: normal !important')
+    }
+
+    if (rules.length) {
+      out.push(`${mark} { ${rules.join('; ')}; }`)
+    }
+
+    if (t.size > 0) {
+      out.push(`${mark} > :not([aria-hidden]) > * { font-size: ${t.size}px !important; }`)
+    }
+  }
+
+  if (!t.tagline) {
+    out.push(`${tag} { display: none !important; }`)
+  }
+
+  if (t.glow) {
+    out.push(`${html} [data-slot='aui_thread-viewport']:has([data-slot='aui_intro']) {
+      background:
+        radial-gradient(60rem 36rem at 88% -8%, color-mix(in srgb, var(--ui-accent) 28%, transparent), transparent 70%),
+        radial-gradient(50rem 30rem at -6% 108%, color-mix(in srgb, var(--ui-accent) 18%, transparent), transparent 70%);
+    }`)
+  }
+
+  return out.join('\n')
+}
+
+// Swap the words by rewriting the wordmark's text nodes in place. React keeps its own
+// references to those nodes, so editing nodeValue is safe; the original is remembered
+// per node and restored when the field is cleared.
+function syncTitleText(text) {
+  for (const mark of document.querySelectorAll(TITLE_MARK)) {
+    const walker = document.createTreeWalker(mark, NodeFilter.SHOW_TEXT)
+
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (text) {
+        if (n.__shOrig === undefined) n.__shOrig = n.nodeValue
+        if (n.nodeValue !== text) n.nodeValue = text
+      } else if (n.__shOrig !== undefined) {
+        n.nodeValue = n.__shOrig
+        delete n.__shOrig
+      }
+    }
+
+    if (text) {
+      if (mark.__shLabel === undefined) mark.__shLabel = mark.getAttribute('aria-label') ?? ''
+      mark.setAttribute('aria-label', text)
+    } else if (mark.__shLabel !== undefined) {
+      mark.setAttribute('aria-label', mark.__shLabel)
+      delete mark.__shLabel
+    }
+  }
+}
+
+function syncTitle() {
+  const t = $prefs.get().title
+
+  if (!titleStyleEl || !titleStyleEl.isConnected) {
+    titleStyleEl = document.createElement('style')
+    titleStyleEl.id = TITLE_STYLE_ID
+    document.documentElement.appendChild(titleStyleEl)
+  }
+
+  const css = titleCss(t)
+
+  if (titleStyleEl.textContent !== css) titleStyleEl.textContent = css
+  document.documentElement.setAttribute(TITLE_ATTR, '')
+  syncTitleText(t.text)
+}
+
+function removeTitle() {
+  syncTitleText('')
+  titleStyleEl?.remove()
+  titleStyleEl = null
+  document.documentElement.removeAttribute(TITLE_ATTR)
+}
+
+function openSettings() {
+  const path = typeof pluginSettingsHref === 'function' ? pluginSettingsHref(ID) : '/settings?tab=plugins'
+  if (typeof host.navigate === 'function') host.navigate(path)
+}
+
+async function loadSessions() {
+  const now = Date.now()
+  if (now - sessionsCache.at < 60_000) return sessionsCache.rows
+  if (sessionsInflight) return sessionsInflight
+  sessionsInflight = host.request('session.list', { limit: 8 })
+    .then(result => {
+      const rows = Array.isArray(result?.sessions) ? result.sessions : []
+      sessionsCache = {
+        at: Date.now(),
+        rows: rows.filter(row => row && row.id && (row.message_count == null || row.message_count > 0)).slice(0, 4)
+      }
+      return sessionsCache.rows
+    })
+    .catch(() => sessionsCache.rows)
+    .finally(() => {
+      sessionsInflight = null
+    })
+  return sessionsInflight
+}
+
+function sessionTitle(row) {
+  const title = String(row.title || row.preview || '').trim()
+  return title || 'Untitled chat'
+}
+
+async function usePrompt(text) {
+  haptic?.('tap')
+  const composer = host.composer
+  if (composer && typeof composer.setDraft === 'function') {
+    const ok = await composer.setDraft('new', text)
+    if (ok) {
+      composer.focus?.('new')
+      return
+    }
+  }
+  if (composer && typeof composer.insertText === 'function') {
+    const ok = await composer.insertText(null, text, { mode: 'block' })
+    if (ok) return
+  }
+  host.notify?.({ kind: 'info', message: 'Could not place that in the composer.' })
+}
+
+async function openRecent(id) {
+  haptic?.('tap')
+  if (typeof host.openSession !== 'function') {
+    host.notify?.({ kind: 'info', message: 'Opening chats from here is not available in this build.' })
+    return
+  }
+  try {
+    await host.openSession(id)
+  } catch (error) {
+    host.notify?.({ kind: 'error', message: error && error.message ? error.message : 'Could not open that chat.' })
+  }
+}
+
+function fillCard(card, prefs, rows) {
+  card.replaceChildren()
+  const clockOn = prefs.widgets.clock || prefs.widgets.greeting
+  if (card.dataset.role === 'clock' && clockOn) {
+    const parts = clockParts()
+    if (prefs.widgets.greeting) card.append(el('div', 'sh-kicker', greeting()))
+    if (prefs.widgets.clock) {
+      const time = el('div', 'sh-time', parts.time)
+      time.dataset.shClock = 'time'
+      card.append(time)
+    }
+    const date = el('div', 'sh-sub', parts.date)
+    date.dataset.shClock = 'date'
+    card.append(date)
+    const link = el('button', 'sh-link', 'Customize')
+    link.type = 'button'
+    link.addEventListener('click', openSettings)
+    card.append(link)
+    card.hidden = false
+    return
+  }
+  if (card.dataset.role === 'meta' && prefs.widgets.model) {
+    card.append(el('div', 'sh-kicker', 'This chat'))
+    card.append(el('div', 'sh-sub', `${profileLabel()} · ${modelLabel()}`))
+    if ($imageError.get()) card.append(el('div', 'sh-sub', $imageError.get()))
+    card.hidden = false
+    return
+  }
+  if (card.dataset.role === 'recents' && prefs.widgets.recents) {
+    card.append(el('div', 'sh-kicker', 'Jump back in'))
+    const list = el('div', 'sh-list')
+    if (!rows.length) {
+      list.append(el('div', 'sh-sub', 'No recent chats yet.'))
+    } else {
+      for (const row of rows) {
+        const button = el('button', 'sh-btn', sessionTitle(row))
+        button.type = 'button'
+        button.title = sessionTitle(row)
+        button.addEventListener('click', () => { void openRecent(row.id) })
+        list.append(button)
+      }
+    }
+    card.append(list)
+    card.hidden = false
+    return
+  }
+  const prompts = prefs.prompts.filter(Boolean).slice(0, 3)
+  if (card.dataset.role === 'prompts' && prefs.widgets.prompts && prompts.length) {
+    card.append(el('div', 'sh-kicker', 'Start with'))
+    const list = el('div', 'sh-list')
+    for (const prompt of prompts) {
+      const button = el('button', 'sh-btn', prompt)
+      button.type = 'button'
+      button.title = prompt
+      button.addEventListener('click', () => { void usePrompt(prompt) })
+      list.append(button)
+    }
+    card.append(list)
+    card.hidden = false
+  }
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag)
+  if (className) node.className = className
+  if (text != null) node.textContent = text
+  return node
+}
+
+function paintArt(art, prefs) {
+  const url = artUrl(prefs) || svgUrl(imageryMarkup('atelier'))
+  const missingCustom = prefs.imagery === 'custom' && !artUrl(prefs)
+  art.style.opacity = String(prefs.strength / 100)
+  if (art.dataset.shUrl === url && art.dataset.shMissing === String(missingCustom)) return
+  art.dataset.shUrl = url
+  art.dataset.shMissing = String(missingCustom)
+  art.style.backgroundImage = cssUrl(url)
+  if (missingCustom) {
+    $imageError.set('Add an image in Stagehand settings.')
+    return
+  }
+  if (prefs.imagery !== 'custom' || !/^https?:/i.test(url)) {
+    $imageError.set('')
+    return
+  }
+  const probe = new Image()
+  probe.onload = () => $imageError.set('')
+  probe.onerror = () => {
+    if (art.dataset.shUrl !== url) return
+    $imageError.set('That image URL did not load.')
+    const fallback = svgUrl(imageryMarkup('atelier'))
+    art.dataset.shUrl = fallback
+    art.style.backgroundImage = cssUrl(fallback)
+  }
+  probe.src = url
+}
+
+function ensureStage(bounds) {
+  let record = stages.get(bounds)
+  if (record) return record
+  const art = el('div', 'sh-art')
+  art.setAttribute('aria-hidden', 'true')
+  const widgets = el('div', 'sh-widgets')
+  widgets.style.containerType = 'inline-size'
+  const clock = el('div', 'sh-card sh-clock')
+  const meta = el('div', 'sh-card sh-meta')
+  const recents = el('div', 'sh-card sh-recents')
+  const prompts = el('div', 'sh-card sh-prompts')
+  clock.dataset.role = 'clock'
+  meta.dataset.role = 'meta'
+  recents.dataset.role = 'recents'
+  prompts.dataset.role = 'prompts'
+  for (const card of [clock, meta, recents, prompts]) card.hidden = true
+  widgets.append(clock, meta, recents, prompts)
+  bounds.prepend(art)
+  bounds.append(widgets)
+  record = { art, widgets, clock, meta, recents, prompts, signature: '' }
+  stages.set(bounds, record)
+  return record
+}
+
+function dropStage(bounds) {
+  const record = stages.get(bounds)
+  if (!record) return
+  record.art.remove()
+  record.widgets.remove()
+  stages.delete(bounds)
+}
+
+function widgetSignature(prefs) {
+  return JSON.stringify({
+    widgets: prefs.widgets,
+    prompts: prefs.prompts,
+    profile: profileLabel(),
+    model: modelLabel(),
+    error: $imageError.get()
+  })
+}
+
+async function refreshStage(bounds, prefs) {
+  const record = ensureStage(bounds)
+  const generation = (record.generation || 0) + 1
+  record.generation = generation
+  paintArt(record.art, prefs)
+  const signature = widgetSignature(prefs)
+  if (signature === record.signature) {
+    tickClock(record)
+    return
+  }
+  const rows = prefs.widgets.recents ? await loadSessions() : []
+  if (generation !== record.generation) return
+  if (!bounds.isConnected || !bounds.querySelector('[data-slot="aui_intro"]')) {
+    dropStage(bounds)
+    return
+  }
+  fillCard(record.clock, prefs, rows)
+  fillCard(record.meta, prefs, rows)
+  fillCard(record.recents, prefs, rows)
+  fillCard(record.prompts, prefs, rows)
+  record.signature = widgetSignature(prefs)
+}
+
+function tickClock(record) {
+  if (!record || !record.clock.isConnected) return
+  const parts = clockParts()
+  const time = record.clock.querySelector('[data-sh-clock="time"]')
+  const date = record.clock.querySelector('[data-sh-clock="date"]')
+  if (time) time.textContent = parts.time
+  if (date) date.textContent = parts.date
+  const kicker = record.clock.querySelector('.sh-kicker')
+  if (kicker) kicker.textContent = greeting()
+}
+
+function syncStages() {
+  if (!document.body) return
+  syncTitle()
+  const prefs = $prefs.get()
+  if (!prefs.enabled) {
+    for (const bounds of [...stages.keys()]) dropStage(bounds)
+    return
+  }
+  ensureStyle()
+  const live = new Set()
+  for (const intro of document.querySelectorAll('[data-slot="aui_intro"]')) {
+    const bounds = intro.closest('[data-slot="composer-bounds"]') || intro.closest('[data-chat-surface]')
+    if (!bounds) continue
+    live.add(bounds)
+    void refreshStage(bounds, prefs)
+  }
+  for (const bounds of [...stages.keys()]) {
+    if (!live.has(bounds) || !bounds.isConnected) dropStage(bounds)
+  }
+}
+
+function scheduleSync() {
+  if (syncTimer) return
+  syncTimer = setTimeout(() => {
+    syncTimer = null
+    syncStages()
+  }, 40)
+}
+
+function installWatcher() {
+  if (observer || !document.body) return
+  observer = new MutationObserver(scheduleSync)
+  observer.observe(document.body, { characterData: true, childList: true, subtree: true })
+  const themeRoot = document.documentElement
+  observer.observe(themeRoot, { attributes: true, attributeFilter: ['class', 'data-hermes-theme'] })
+}
+
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error('Could not read that image.'))
+    reader.onload = () => {
+      const original = String(reader.result || '')
+      if (file.type === 'image/gif' && original.length <= MAX_IMAGE_CHARS) {
+        resolve(original)
+        return
+      }
+      const image = new Image()
+      image.onload = () => {
+        const scale = Math.min(1, 1600 / Math.max(image.width, image.height, 1))
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.max(1, Math.round(image.width * scale))
+        canvas.height = Math.max(1, Math.round(image.height * scale))
+        const context = canvas.getContext('2d')
+        if (!context) {
+          reject(new Error('Could not prepare that image.'))
+          return
+        }
+        context.drawImage(image, 0, 0, canvas.width, canvas.height)
+        let quality = 0.72
+        let data = canvas.toDataURL('image/jpeg', quality)
+        while (data.length > MAX_IMAGE_CHARS && quality > 0.4) {
+          quality -= 0.08
+          data = canvas.toDataURL('image/jpeg', quality)
+        }
+        if (data.length > MAX_IMAGE_CHARS) {
+          reject(new Error('That image is still too large after compressing. Try a smaller file or an https URL.'))
+          return
+        }
+        resolve(data)
+      }
+      image.onerror = () => reject(new Error('That file is not a readable image.'))
+      image.src = original
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
+function updatePrefs(patch) {
+  const next = clonePrefs(
+    {
+      ...$prefs.get(),
+      ...patch,
+      title: { ...$prefs.get().title, ...(patch.title || {}) },
+      widgets: { ...$prefs.get().widgets, ...(patch.widgets || {}) }
+    },
+    Object.hasOwn(patch, 'prompts')
+  )
+  $prefs.set(next)
+  pluginCtx?.storage.set('prefs', next)
+  for (const record of stages.values()) record.signature = ''
+  scheduleSync()
+}
+
+function SettingsPanel() {
+  const prefs = useValue($prefs)
+  const hasImage = useValue($hasImage)
+  const imageError = useValue($imageError)
+
+  const pickFile = () => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/png,image/jpeg,image/webp,image/gif,image/avif'
+    input.onchange = () => {
+      const file = input.files && input.files[0]
+      if (!file || !pluginCtx) return
+      compressImage(file)
+        .then(dataUrl => {
+          pluginCtx.storage.set('image', dataUrl)
+          $hasImage.set(true)
+          updatePrefs({ imagery: 'custom' })
+          host.notify?.({ kind: 'info', message: 'Background image saved for new chats.' })
+        })
+        .catch(error => {
+          host.notify?.({ kind: 'error', message: error.message || 'Could not save that image.' })
+        })
+    }
+    input.click()
+  }
+
+  const clearImage = () => {
+    pluginCtx?.storage.remove('image')
+    $hasImage.set(false)
+    updatePrefs({ imagery: prefs.imagery === 'custom' ? 'atelier' : prefs.imagery })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-4 text-sm text-(--ui-text-secondary)',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-3',
+        children: [
+          jsxs('div', {
+            children: [
+              jsx('div', { className: 'text-(--ui-text-primary)', children: 'Show on new chats' }),
+              jsx('p', { className: 'm-0 mt-1 text-xs text-(--ui-text-tertiary)', children: 'Imagery and widgets appear only on the empty new-chat screen. Ongoing chats stay plain.' })
+            ]
+          }),
+          jsx(Switch, { checked: prefs.enabled, onCheckedChange: enabled => updatePrefs({ enabled }) })
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex flex-col gap-2',
+        children: [
+          jsx('div', { className: 'text-(--ui-text-primary)', children: 'Imagery' }),
+          jsx('div', {
+            className: 'flex flex-wrap gap-1.5',
+            children: IMAGERY.map(item => jsx(Button, {
+              type: 'button',
+              variant: prefs.imagery === item.id ? 'default' : 'secondary',
+              onClick: () => updatePrefs({ imagery: item.id }),
+              children: item.label
+            }, item.id))
+          }),
+          jsxs('label', {
+            className: 'mt-1 flex flex-col gap-1 text-xs text-(--ui-text-tertiary)',
+            children: [
+              `Strength ${prefs.strength}%`,
+              jsx('input', {
+                type: 'range',
+                min: 8,
+                max: 70,
+                value: prefs.strength,
+                onChange: event => updatePrefs({ strength: Number(event.target.value) }),
+                style: { accentColor: 'var(--ui-accent)' }
+              })
+            ]
+          })
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex flex-col gap-2',
+        children: [
+          jsx('div', { className: 'text-(--ui-text-primary)', children: 'Your image' }),
+          jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: hasImage ? 'A local image is saved on this Mac.' : 'No local image saved yet. A URL is used only while My image is selected.' }),
+          jsxs('div', {
+            className: 'flex flex-wrap gap-2',
+            children: [
+              jsx(Button, { type: 'button', variant: 'secondary', onClick: pickFile, children: 'Choose image' }),
+              jsx(Button, { type: 'button', variant: 'ghost', onClick: clearImage, disabled: !hasImage, children: 'Clear saved image' })
+            ]
+          }),
+          jsx(Input, {
+            placeholder: 'https://… image URL',
+            value: prefs.customUrl,
+            onChange: event => updatePrefs({ customUrl: event.target.value, imagery: 'custom' })
+          }),
+          imageError ? jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: imageError }) : null
+        ]
+      }),
+      jsx(TitleSection, { prefs }),
+      jsxs('div', {
+        className: 'flex flex-col gap-2',
+        children: [
+          jsx('div', { className: 'text-(--ui-text-primary)', children: 'Widgets' }),
+          jsx(WidgetToggle, { label: 'Clock and date', checked: prefs.widgets.clock, onChange: clock => updatePrefs({ widgets: { clock } }) }),
+          jsx(WidgetToggle, { label: 'Greeting', checked: prefs.widgets.greeting, onChange: greetingOn => updatePrefs({ widgets: { greeting: greetingOn } }) }),
+          jsx(WidgetToggle, { label: 'Profile and model', checked: prefs.widgets.model, onChange: model => updatePrefs({ widgets: { model } }) }),
+          jsx(WidgetToggle, { label: 'Recent chats', checked: prefs.widgets.recents, onChange: recents => updatePrefs({ widgets: { recents } }) }),
+          jsx(WidgetToggle, { label: 'Starter prompts', checked: prefs.widgets.prompts, onChange: prompts => updatePrefs({ widgets: { prompts } }) }),
+          jsx(Textarea, {
+            rows: 4,
+            value: prefs.prompts.join('\n'),
+            onChange: event => updatePrefs({ prompts: event.target.value.split(/\n/) })
+          }),
+          jsx('p', { className: 'm-0 text-xs text-(--ui-text-tertiary)', children: 'One starter prompt per line. Clicking one fills the new-chat composer. It does not send.' })
+        ]
+      }),
+      jsx(Button, {
+        type: 'button',
+        variant: 'secondary',
+        onClick: () => {
+          if (host.settings && typeof host.settings.set === 'function') host.settings.set('intro-splash.v1', true)
+          host.notify?.({ kind: 'info', message: 'Intro splash is on. Open a new chat to see the stage.' })
+        },
+        children: 'Make sure the new-chat splash is on'
+      })
+    ]
+  })
+}
+
+function TitleSection({ prefs }) {
+  const t = prefs.title
+  const set = patch => updatePrefs({ title: patch })
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2',
+    children: [
+      jsx('div', { className: 'text-(--ui-text-primary)', children: 'Title' }),
+      jsx(WidgetToggle, { label: 'Show the big title', checked: t.show, onChange: show => set({ show }) }),
+      jsx(WidgetToggle, { label: 'Show the line underneath', checked: t.tagline, onChange: tagline => set({ tagline }) }),
+      jsx(WidgetToggle, { label: 'Soft accent glow', checked: t.glow, onChange: glow => set({ glow }) }),
+      jsx(Input, {
+        placeholder: 'Title text (blank = Hermes Agent)',
+        maxLength: 60,
+        value: t.text,
+        onChange: event => set({ text: event.target.value })
+      }),
+      jsx('div', {
+        className: 'flex flex-wrap gap-1.5',
+        children: FAMILY_OPTIONS.map(item => jsx(Button, {
+          type: 'button',
+          variant: t.family === item.id ? 'default' : 'secondary',
+          onClick: () => set({ family: item.id }),
+          children: item.label
+        }, item.id))
+      }),
+      t.family === 'custom'
+        ? jsx(Input, {
+            placeholder: 'Any installed font, e.g. Avenir Next',
+            value: t.customFamily,
+            onChange: event => set({ customFamily: event.target.value })
+          })
+        : null,
+      jsxs('label', {
+        className: 'flex flex-col gap-1 text-xs text-(--ui-text-tertiary)',
+        children: [
+          t.size > 0 ? `Size ${t.size}px` : 'Size: auto (fits the column)',
+          jsx('input', {
+            type: 'range',
+            min: 0,
+            max: 240,
+            step: 4,
+            value: t.size,
+            onChange: event => set({ size: Number(event.target.value) }),
+            style: { accentColor: 'var(--ui-accent)' }
+          })
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex items-center gap-2 text-xs text-(--ui-text-tertiary)',
+        children: [
+          'Color',
+          jsx('input', {
+            type: 'color',
+            value: t.color || '#ffffff',
+            onChange: event => set({ color: event.target.value })
+          }),
+          jsx(Button, { type: 'button', variant: 'ghost', onClick: () => set({ color: '' }), disabled: !t.color, children: 'Reset' })
+        ]
+      })
+    ]
+  })
+}
+
+function WidgetToggle({ label, checked, onChange }) {
+  return jsxs('label', {
+    className: 'flex items-center justify-between gap-3 text-xs',
+    children: [
+      jsx('span', { children: label }),
+      jsx(Switch, { checked, onCheckedChange: onChange })
+    ]
+  })
+}
+
+function StatusChip() {
+  const prefs = useValue($prefs)
+  return jsx(Tip, {
+    label: prefs.enabled ? 'Stagehand is on. Click to hide it.' : 'Stagehand is off. Click to show it.',
+    children: jsx('button', {
+      type: 'button',
+      className: cn(
+        'inline-flex h-full items-center px-1.5 text-[0.6875rem]',
+        prefs.enabled ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-tertiary)'
+      ),
+      onClick: () => {
+        haptic?.('tap')
+        updatePrefs({ enabled: !prefs.enabled })
+      },
+      onContextMenu: event => {
+        event.preventDefault()
+        openSettings()
+      },
+      children: 'stage'
+    })
+  })
+}
+
+export default {
+  id: ID,
+  name: 'Stagehand',
+  register(ctx) {
+    pluginCtx = ctx
+    const stored = ctx.storage.get('prefs', {})
+    $prefs.set(clonePrefs(stored && typeof stored === 'object' ? stored : {}))
+    $hasImage.set(Boolean(safeImageUrl(ctx.storage.get('image', ''))))
+
+    ctx.register({
+      id: 'chip',
+      area: 'statusBar.right',
+      order: 140,
+      render: () => jsx(StatusChip, {})
+    })
+
+    ctx.register({
+      id: 'customize',
+      area: 'palette',
+      data: {
+        id: `${ID}.customize`,
+        label: 'Customize Stagehand',
+        keywords: ['background', 'wallpaper', 'widgets', 'new chat', 'imagery'],
+        run: openSettings
+      }
+    })
+
+    ctx.register({
+      id: 'toggle',
+      area: 'palette',
+      data: {
+        id: `${ID}.toggle`,
+        label: 'Toggle Stagehand',
+        keywords: ['background', 'hide', 'show'],
+        run: () => updatePrefs({ enabled: !$prefs.get().enabled })
+      }
+    })
+
+    if (typeof ctx.registerSettingsPage === 'function') {
+      ctx.registerSettingsPage({
+        id: 'settings',
+        title: 'Stagehand',
+        icon: 'symbol-color',
+        render: () => jsx(SettingsPanel, {})
+      })
+    }
+
+    const unsub = $prefs.subscribe(() => scheduleSync())
+    ctx.onDispose(() => {
+      unsub()
+      observer?.disconnect()
+      observer = null
+      clearTimeout(syncTimer)
+      clearInterval(clockTimer)
+      syncTimer = null
+      for (const bounds of [...stages.keys()]) dropStage(bounds)
+      removeStyle()
+      removeTitle()
+      pluginCtx = null
+    })
+
+    installWatcher()
+    scheduleSync()
+    clockTimer = setInterval(() => {
+      for (const record of stages.values()) tickClock(record)
+    }, 30_000)
+  }
+}
