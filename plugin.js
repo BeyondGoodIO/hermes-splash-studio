@@ -101,15 +101,19 @@ let observer = null
 let clockTimer = null
 let syncTimer = null
 let disposed = false
+// The saved local image, read from storage once (it can be ~900 KB).
+let localImage = ''
+let lastPaletteKey = ''
 let sessionsCache = { at: 0, rows: [] }
 let sessionsInflight = null
 
 function promptLines(prompts, keepBlank) {
-  // While editing (keepBlank) keep lines verbatim so trailing spaces survive typing.
+  // While editing (keepBlank) keep lines verbatim, with room to spare, so trailing spaces
+  // survive typing and pressing Enter mid-list never deletes a prompt. Display caps at three.
   const lines = (Array.isArray(prompts) ? prompts : DEFAULT_PROMPTS)
     .map(line => String(line ?? '').slice(0, 200))
-    .slice(0, MAX_PROMPTS)
-  return keepBlank ? lines : lines.map(line => line.trim()).filter(Boolean)
+    .slice(0, 12)
+  return keepBlank ? lines : lines.map(line => line.trim()).filter(Boolean).slice(0, MAX_PROMPTS)
 }
 
 function clonePrefs(value, keepBlankPrompts = false) {
@@ -132,9 +136,18 @@ function clonePrefs(value, keepBlankPrompts = false) {
   }
 }
 
+const GENERIC_FAMILIES = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded'])
+
 function sanitizeFamily(value) {
-  // A font stack only: no braces, semicolons, url() or @import, so it cannot break out of its rule.
-  return String(value || '').replace(/[{};<>\\]|url\(|@import/gi, '').slice(0, 200)
+  // Letters, digits, spaces, hyphens, dots and commas only. Anything else (quotes, braces,
+  // semicolons, slashes, parentheses) is dropped, so the value can't break out of its rule.
+  return String(value || '').replace(/[^\p{L}\p{N} ,.\-]/gu, '').slice(0, 200)
+}
+
+// Build a font-family list with each name quoted (generic keywords stay bare).
+function familyStack(value) {
+  const names = sanitizeFamily(value).split(',').map(name => name.trim().replace(/\s+/g, ' ')).filter(Boolean)
+  return names.map(name => (GENERIC_FAMILIES.has(name.toLowerCase()) ? name.toLowerCase() : `"${name}"`)).join(', ')
 }
 
 function sanitizeColor(value) {
@@ -227,9 +240,7 @@ function imageryMarkup(id) {
 
 function artUrl(prefs) {
   if (prefs.imagery === 'custom') {
-    const stored = pluginCtx ? safeImageUrl(pluginCtx.storage.get('image', '')) : ''
-    const remote = safeImageUrl(prefs.customUrl)
-    return stored || remote
+    return localImage || safeImageUrl(prefs.customUrl)
   }
   return svgUrl(imageryMarkup(prefs.imagery))
 }
@@ -341,6 +352,11 @@ function ensureStyle() {
       padding: 0;
     }
     .sh-link:hover { color: var(--foreground); }
+    .sh-btn:focus-visible, .sh-link:focus-visible {
+      outline: 2px solid var(--ui-accent);
+      outline-offset: 1px;
+      color: var(--foreground);
+    }
     @container (max-width: 860px) {
       .sh-grid { grid-template-columns: 1fr; grid-template-rows: auto auto minmax(0, 1fr) auto; }
       .sh-clock, .sh-meta, .sh-recents, .sh-prompts { grid-column: 1; justify-self: start; text-align: left; }
@@ -375,7 +391,8 @@ function titleCss(t) {
     const rules = []
 
     if (t.family !== 'stock') {
-      const stack = t.family === 'custom' ? sanitizeFamily(t.customFamily) || TITLE_FAMILIES.serif : TITLE_FAMILIES[t.family]
+      const custom = t.family === 'custom' ? familyStack(t.customFamily) : ''
+      const stack = t.family === 'custom' ? (custom ? `${custom}, ${TITLE_FAMILIES.serif}` : TITLE_FAMILIES.serif) : TITLE_FAMILIES[t.family]
       rules.push(
         `font-family: ${stack} !important`,
         'font-weight: 600 !important',
@@ -475,19 +492,23 @@ async function loadSessions() {
   const now = Date.now()
   if (now - sessionsCache.at < 60_000) return sessionsCache.rows
   if (sessionsInflight) return sessionsInflight
-  sessionsInflight = host.request('session.list', { limit: 8 })
-    .then(result => {
+  if (typeof host.request !== 'function') return sessionsCache.rows
+  sessionsInflight = (async () => {
+    try {
+      // Short explicit timeout: a slow gateway must not leave the card waiting for 30s.
+      const result = await host.request('session.list', { limit: 8 }, 5000)
       const rows = Array.isArray(result?.sessions) ? result.sessions : []
       sessionsCache = {
         at: Date.now(),
         rows: rows.filter(row => row && row.id && (row.message_count == null || row.message_count > 0)).slice(0, 4)
       }
-      return sessionsCache.rows
-    })
-    .catch(() => sessionsCache.rows)
-    .finally(() => {
+    } catch {
+      // Keep whatever we had; the card shows its empty state.
+    } finally {
       sessionsInflight = null
-    })
+    }
+    return sessionsCache.rows
+  })()
   return sessionsInflight
 }
 
@@ -507,7 +528,8 @@ async function usePrompt(text) {
     }
   }
   if (composer && typeof composer.insertText === 'function') {
-    const ok = await composer.insertText(null, text, { mode: 'block' })
+    // Target the new-chat composer only, never whichever chat happens to be active.
+    const ok = await composer.insertText('new', text, { mode: 'block' })
     if (ok) return
   }
   host.notify?.({ kind: 'info', message: 'Could not place that in the composer.' })
@@ -528,6 +550,8 @@ async function openRecent(id) {
 
 function fillCard(card, prefs, rows) {
   card.replaceChildren()
+  // Start hidden; each branch below re-shows its card only if that widget is on.
+  card.hidden = true
   const clockOn = prefs.widgets.clock || prefs.widgets.greeting
   if (card.dataset.role === 'clock' && clockOn) {
     const parts = clockParts()
@@ -548,7 +572,7 @@ function fillCard(card, prefs, rows) {
     return
   }
   if (card.dataset.role === 'meta' && prefs.widgets.model) {
-    card.append(el('div', 'sh-kicker', 'This chat'))
+    card.append(el('div', 'sh-kicker', 'New chat'))
     card.append(el('div', 'sh-sub', `${profileLabel()} · ${modelLabel()}`))
     if ($imageError.get()) card.append(el('div', 'sh-sub', $imageError.get()))
     card.hidden = false
@@ -595,29 +619,41 @@ function el(tag, className, text) {
   return node
 }
 
+// Short, stable key for an image URL so a ~900 KB data URL is never copied into the DOM.
+function urlKey(url) {
+  if (url.length <= 2048) return url
+  let hash = 0
+  for (let i = 0; i < url.length; i += 97) hash = (hash * 31 + url.charCodeAt(i)) | 0
+  return `big:${url.length}:${hash}:${url.slice(-32)}`
+}
+
 function paintArt(art, prefs) {
-  const url = artUrl(prefs) || svgUrl(imageryMarkup('atelier'))
-  const missingCustom = prefs.imagery === 'custom' && !artUrl(prefs)
+  const chosen = artUrl(prefs)
+  const url = chosen || svgUrl(imageryMarkup('atelier'))
+  const missingCustom = prefs.imagery === 'custom' && !chosen
+  const key = urlKey(url)
   art.style.opacity = String(prefs.strength / 100)
-  if (art.dataset.shUrl === url && art.dataset.shMissing === String(missingCustom)) return
-  art.dataset.shUrl = url
+  if (art.dataset.shUrl === key && art.dataset.shMissing === String(missingCustom)) return
+  art.dataset.shUrl = key
   art.dataset.shMissing = String(missingCustom)
   art.style.backgroundImage = cssUrl(url)
   if (missingCustom) {
     $imageError.set('Add an image in Stagehand settings.')
     return
   }
-  if (prefs.imagery !== 'custom' || !/^https?:/i.test(url)) {
+  if (prefs.imagery !== 'custom' || !/^https:/i.test(url)) {
     $imageError.set('')
     return
   }
   const probe = new Image()
-  probe.onload = () => $imageError.set('')
+  probe.onload = () => {
+    if (art.dataset.shUrl === key) $imageError.set('')
+  }
   probe.onerror = () => {
-    if (art.dataset.shUrl !== url) return
+    if (art.dataset.shUrl !== key) return
     $imageError.set('That image URL did not load.')
     const fallback = svgUrl(imageryMarkup('atelier'))
-    art.dataset.shUrl = fallback
+    art.dataset.shUrl = urlKey(fallback)
     art.style.backgroundImage = cssUrl(fallback)
   }
   probe.src = url
@@ -670,25 +706,32 @@ function widgetSignature(prefs) {
 
 async function refreshStage(bounds, prefs) {
   const record = ensureStage(bounds)
-  const generation = (record.generation || 0) + 1
-  record.generation = generation
   paintArt(record.art, prefs)
   const signature = widgetSignature(prefs)
   if (signature === record.signature) {
     tickClock(record)
     return
   }
-  const rows = prefs.widgets.recents ? await loadSessions() : []
-  if (disposed || generation !== record.generation) return
-  if (!bounds.isConnected || !bounds.querySelector('[data-slot="aui_intro"]')) {
+  const generation = (record.generation || 0) + 1
+  record.generation = generation
+  record.signature = signature
+  // Everything except recents fills right away; recents never holds the others back.
+  fillCard(record.clock, prefs, [])
+  fillCard(record.meta, prefs, [])
+  fillCard(record.prompts, prefs, [])
+  if (!prefs.widgets.recents) {
+    fillCard(record.recents, prefs, [])
+    return
+  }
+  if (sessionsCache.at > 0) fillCard(record.recents, prefs, sessionsCache.rows)
+  const rows = await loadSessions()
+  // Bail if superseded, disposed, or this record was replaced by a newer stage.
+  if (disposed || generation !== record.generation || stages.get(bounds) !== record) return
+  if (!bounds.isConnected || !bounds.querySelector(INTRO)) {
     dropStage(bounds)
     return
   }
-  fillCard(record.clock, prefs, rows)
-  fillCard(record.meta, prefs, rows)
   fillCard(record.recents, prefs, rows)
-  fillCard(record.prompts, prefs, rows)
-  record.signature = widgetSignature(prefs)
 }
 
 function tickClock(record) {
@@ -709,6 +752,7 @@ function syncStages() {
     // Off means fully off: imagery, widgets and title changes all go away.
     for (const bounds of [...stages.keys()]) dropStage(bounds)
     removeTitle()
+    removeStyle()
     return
   }
   syncTitle()
@@ -733,11 +777,25 @@ function scheduleSync() {
   }, 40)
 }
 
+function paletteKey() {
+  const { accent, fg, bg } = palette()
+  return `${accent}|${fg}|${bg}`
+}
+
 // Only wake up for changes that can matter to the new-chat screen. Streaming replies in
 // ongoing chats mutate the DOM constantly; those batches must cost a few cheap checks, not a resync.
 function mutationsMatter(records) {
   for (const record of records) {
-    if (record.type === 'attributes') return true
+    if (record.type === 'attributes') {
+      if (record.attributeName !== 'style') return true
+      // Root inline style also carries things like text scale; resync only if colors changed.
+      const key = paletteKey()
+      if (key !== lastPaletteKey) {
+        lastPaletteKey = key
+        return true
+      }
+      continue
+    }
     for (const node of record.addedNodes) {
       if (node.nodeType !== 1) continue
       if (node.closest?.('.sh-widgets, .sh-art')) continue
@@ -845,7 +903,13 @@ function SettingsPanel() {
       compressImage(file)
         .then(dataUrl => {
           pluginCtx.storage.set('image', dataUrl)
-          $hasImage.set(true)
+          // Storage can silently drop a write when it's full; confirm it actually saved.
+          if (pluginCtx.storage.get('image', '') !== dataUrl) {
+            host.notify?.({ kind: 'error', message: 'Not enough room to save that image. Try a smaller one or an https URL.' })
+            return
+          }
+          localImage = safeImageUrl(dataUrl)
+          $hasImage.set(Boolean(localImage))
           updatePrefs({ imagery: 'custom' })
           host.notify?.({ kind: 'info', message: 'Background image saved for new chats.' })
         })
@@ -858,7 +922,9 @@ function SettingsPanel() {
 
   const clearImage = () => {
     pluginCtx?.storage.remove('image')
+    localImage = ''
     $hasImage.set(false)
+    for (const record of stages.values()) record.art.dataset.shUrl = ''
     updatePrefs({ imagery: prefs.imagery === 'custom' ? 'atelier' : prefs.imagery })
   }
 
@@ -944,8 +1010,12 @@ function SettingsPanel() {
         type: 'button',
         variant: 'secondary',
         onClick: () => {
-          if (host.settings && typeof host.settings.set === 'function') host.settings.set('intro-splash.v1', true)
-          host.notify?.({ kind: 'info', message: 'Intro splash is on. Open a new chat to see the stage.' })
+          if (host.settings && typeof host.settings.set === 'function') {
+            host.settings.set('intro-splash.v1', true)
+            host.notify?.({ kind: 'info', message: 'Intro splash is on. Open a new chat to see the stage.' })
+          } else {
+            host.notify?.({ kind: 'info', message: 'This Hermes version cannot change that from a plugin. Check Settings > Appearance.' })
+          }
         },
         children: 'Make sure the new-chat splash is on'
       })
@@ -986,7 +1056,10 @@ function ImageUrlField({ value }) {
       jsx(Input, {
         placeholder: 'https://… image URL (press Enter to use it)',
         value: draft,
-        onChange: event => setDraft(event.target.value),
+        onChange: event => {
+          setDraft(event.target.value)
+          if (note) setNote('')
+        },
         onBlur: commit,
         onKeyDown: event => {
           if (event.key === 'Enter') {
@@ -1057,6 +1130,7 @@ function TitleSection({ prefs }) {
           'Color',
           jsx('input', {
             type: 'color',
+            'aria-label': 'Title color',
             value: t.color || '#ffffff',
             onChange: event => set({ color: event.target.value })
           }),
@@ -1109,7 +1183,9 @@ export default {
     sessionsCache = { at: 0, rows: [] }
     const stored = ctx.storage.get('prefs', {})
     $prefs.set(clonePrefs(stored && typeof stored === 'object' ? stored : {}))
-    $hasImage.set(Boolean(safeImageUrl(ctx.storage.get('image', ''))))
+    localImage = safeImageUrl(ctx.storage.get('image', ''))
+    $hasImage.set(Boolean(localImage))
+    lastPaletteKey = paletteKey()
 
     ctx.register({
       id: 'chip',
@@ -1150,9 +1226,17 @@ export default {
     }
 
     const unsub = $prefs.subscribe(() => scheduleSync())
+    // Keep the profile/model card current when either changes on the new-chat screen.
+    const stateUnsubs = ['model', 'profile']
+      .map(key => host.state?.[key])
+      .filter(value => value && typeof value.subscribe === 'function')
+      .map(value => value.subscribe(() => scheduleSync()))
     ctx.onDispose(() => {
       disposed = true
       unsub()
+      for (const off of stateUnsubs) {
+        if (typeof off === 'function') off()
+      }
       observer?.disconnect()
       observer = null
       clearTimeout(syncTimer)

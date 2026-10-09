@@ -13,11 +13,11 @@ Ongoing chats are never touched. Turn Stagehand off and everything goes back to 
 
 ## Install
 
-1. Copy this repo into `~/.hermes/desktop-plugins/stagehand`. The folder name has to be `stagehand`.
+1. Copy this repo into `~/.hermes/desktop-plugins/stagehand`.
    ```bash
    git clone https://github.com/BeyondGoodIO/stagehand ~/.hermes/desktop-plugins/stagehand
    ```
-   Or download the ZIP from GitHub, unzip it, and rename the folder to `stagehand`.
+   Or download the ZIP from GitHub and unzip it there.
 2. Hermes picks it up within a few seconds. If it doesn't, press Cmd+K and run **Reload desktop plugins**.
 3. Open a new chat to see it. To customize, open **Settings > Plugins > Stagehand**, or press Cmd+K and run **Customize Stagehand**.
 
@@ -28,7 +28,7 @@ Ongoing chats are never touched. Turn Stagehand off and everything goes back to 
 
 ## Privacy
 
-Stagehand doesn't send anything anywhere. The only network request it can make is loading an image URL you type in yourself. That image is fetched from its website each time a new chat opens, so that site can see when you open new chats. A local image you choose is stored by the Hermes app on your computer and never leaves it.
+Stagehand has no server and no tracking. It asks your own Hermes backend for your recent chat titles, the same way the app's sidebar does. The only outside request it can make is loading an image URL you type in yourself. That image is fetched from its website each time a new chat opens, so that site can see when you open new chats. A local image you choose is stored by the Hermes app on your computer and never leaves it.
 
 ## Remove
 
