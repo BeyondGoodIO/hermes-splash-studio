@@ -104,6 +104,8 @@ let disposed = false
 // The saved local image, read from storage once (it can be ~900 KB).
 let localImage = ''
 let lastPaletteKey = ''
+// Image URLs that failed to load this session; never re-requested until the URL changes.
+const failedUrls = new Set()
 let sessionsCache = { at: 0, rows: [] }
 let sessionsInflight = null
 
@@ -136,7 +138,7 @@ function clonePrefs(value, keepBlankPrompts = false) {
   }
 }
 
-const GENERIC_FAMILIES = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded'])
+const GENERIC_FAMILIES = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded', '-apple-system', 'blinkmacsystemfont'])
 
 function sanitizeFamily(value) {
   // Letters, digits, spaces, hyphens, dots and commas only. Anything else (quotes, braces,
@@ -147,7 +149,7 @@ function sanitizeFamily(value) {
 // Build a font-family list with each name quoted (generic keywords stay bare).
 function familyStack(value) {
   const names = sanitizeFamily(value).split(',').map(name => name.trim().replace(/\s+/g, ' ')).filter(Boolean)
-  return names.map(name => (GENERIC_FAMILIES.has(name.toLowerCase()) ? name.toLowerCase() : `"${name}"`)).join(', ')
+  return names.map(name => (GENERIC_FAMILIES.has(name.toLowerCase()) ? name : `"${name}"`)).join(', ')
 }
 
 function sanitizeColor(value) {
@@ -489,27 +491,32 @@ function openSettings() {
 }
 
 async function loadSessions() {
+  const profile = profileLabel()
   const now = Date.now()
-  if (now - sessionsCache.at < 60_000) return sessionsCache.rows
-  if (sessionsInflight) return sessionsInflight
-  if (typeof host.request !== 'function') return sessionsCache.rows
-  sessionsInflight = (async () => {
+  // The cache belongs to one profile; a profile switch is a cache miss.
+  if (sessionsCache.profile === profile && now - sessionsCache.at < 60_000) return sessionsCache.rows
+  if (sessionsInflight && sessionsInflight.profile === profile) return sessionsInflight.promise
+  if (typeof host.request !== 'function') return null
+  const promise = (async () => {
     try {
       // Short explicit timeout: a slow gateway must not leave the card waiting for 30s.
       const result = await host.request('session.list', { limit: 8 }, 5000)
+      if (profileLabel() !== profile) return null
       const rows = Array.isArray(result?.sessions) ? result.sessions : []
       sessionsCache = {
         at: Date.now(),
+        profile,
         rows: rows.filter(row => row && row.id && (row.message_count == null || row.message_count > 0)).slice(0, 4)
       }
+      return sessionsCache.rows
     } catch {
-      // Keep whatever we had; the card shows its empty state.
+      return null
     } finally {
-      sessionsInflight = null
+      if (sessionsInflight?.promise === promise) sessionsInflight = null
     }
-    return sessionsCache.rows
   })()
-  return sessionsInflight
+  sessionsInflight = { profile, promise }
+  return promise
 }
 
 function sessionTitle(row) {
@@ -628,7 +635,9 @@ function urlKey(url) {
 }
 
 function paintArt(art, prefs) {
-  const chosen = artUrl(prefs)
+  const picked = artUrl(prefs)
+  const broken = Boolean(picked) && failedUrls.has(picked)
+  const chosen = broken ? '' : picked
   const url = chosen || svgUrl(imageryMarkup('atelier'))
   const missingCustom = prefs.imagery === 'custom' && !chosen
   const key = urlKey(url)
@@ -638,7 +647,7 @@ function paintArt(art, prefs) {
   art.dataset.shMissing = String(missingCustom)
   art.style.backgroundImage = cssUrl(url)
   if (missingCustom) {
-    $imageError.set('Add an image in Stagehand settings.')
+    $imageError.set(broken ? 'That image URL did not load.' : 'Add an image in Stagehand settings.')
     return
   }
   if (prefs.imagery !== 'custom' || !/^https:/i.test(url)) {
@@ -650,11 +659,15 @@ function paintArt(art, prefs) {
     if (art.dataset.shUrl === key) $imageError.set('')
   }
   probe.onerror = () => {
+    // Remember the failure so later syncs don't download the broken URL again.
+    failedUrls.add(url)
     if (art.dataset.shUrl !== key) return
     $imageError.set('That image URL did not load.')
     const fallback = svgUrl(imageryMarkup('atelier'))
     art.dataset.shUrl = urlKey(fallback)
     art.style.backgroundImage = cssUrl(fallback)
+    for (const record of stages.values()) record.signature = ''
+    scheduleSync()
   }
   probe.src = url
 }
@@ -723,12 +736,18 @@ async function refreshStage(bounds, prefs) {
     fillCard(record.recents, prefs, [])
     return
   }
-  if (sessionsCache.at > 0) fillCard(record.recents, prefs, sessionsCache.rows)
+  if (sessionsCache.at > 0 && sessionsCache.profile === profileLabel()) fillCard(record.recents, prefs, sessionsCache.rows)
   const rows = await loadSessions()
   // Bail if superseded, disposed, or this record was replaced by a newer stage.
   if (disposed || generation !== record.generation || stages.get(bounds) !== record) return
   if (!bounds.isConnected || !bounds.querySelector(INTRO)) {
     dropStage(bounds)
+    return
+  }
+  if (rows === null) {
+    // Couldn't load: hide the card and let the next sync try again.
+    record.signature = ''
+    if (sessionsCache.profile !== profileLabel()) fillCard(record.recents, { ...prefs, widgets: { ...prefs.widgets, recents: false } }, [])
     return
   }
   fillCard(record.recents, prefs, rows)
@@ -753,6 +772,7 @@ function syncStages() {
     for (const bounds of [...stages.keys()]) dropStage(bounds)
     removeTitle()
     removeStyle()
+    $imageError.set('')
     return
   }
   syncTitle()
@@ -767,6 +787,7 @@ function syncStages() {
   for (const bounds of [...stages.keys()]) {
     if (!live.has(bounds) || !bounds.isConnected) dropStage(bounds)
   }
+  if (stages.size) lastPaletteKey = paletteKey()
 }
 
 function scheduleSync() {
@@ -788,7 +809,9 @@ function mutationsMatter(records) {
   for (const record of records) {
     if (record.type === 'attributes') {
       if (record.attributeName !== 'style') return true
-      // Root inline style also carries things like text scale; resync only if colors changed.
+      // Root inline style also carries text scale and pane geometry. Only check colors
+      // when a stage is actually showing; otherwise the next mount reads fresh colors anyway.
+      if (!stages.size) continue
       const key = paletteKey()
       if (key !== lastPaletteKey) {
         lastPaletteKey = key
@@ -902,6 +925,7 @@ function SettingsPanel() {
       if (!file || !pluginCtx) return
       compressImage(file)
         .then(dataUrl => {
+          if (!pluginCtx) return
           pluginCtx.storage.set('image', dataUrl)
           // Storage can silently drop a write when it's full; confirm it actually saved.
           if (pluginCtx.storage.get('image', '') !== dataUrl) {
@@ -925,7 +949,9 @@ function SettingsPanel() {
     localImage = ''
     $hasImage.set(false)
     for (const record of stages.values()) record.art.dataset.shUrl = ''
-    updatePrefs({ imagery: prefs.imagery === 'custom' ? 'atelier' : prefs.imagery })
+    // Fall back to a saved https URL if there is one; otherwise to a preset.
+    const keepCustom = prefs.imagery === 'custom' && Boolean(safeImageUrl(prefs.customUrl))
+    updatePrefs({ imagery: prefs.imagery === 'custom' && !keepCustom ? 'atelier' : prefs.imagery })
   }
 
   return jsxs('div', {
