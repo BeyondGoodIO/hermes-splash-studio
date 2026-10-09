@@ -12,3 +12,4 @@ First public release.
 - Only wakes up for changes to the new-chat screen, so streaming replies in other chats cost nothing
 - Turning it off puts the screen back to stock, title included
 - Headless test suite (`npm test`)
+- Side widgets sit on their own grid, so they stay in place however wide the app makes the composer

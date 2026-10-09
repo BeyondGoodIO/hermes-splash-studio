@@ -305,7 +305,9 @@ function ensureStyle() {
       height: 100%;
       box-sizing: border-box;
       display: grid;
-      grid-template-columns: minmax(9rem, 1fr) min(var(--composer-width, 42rem), 100%) minmax(9rem, 1fr);
+      /* Fixed side columns around a flexible middle. Don't size from the app's
+         --composer-width: it can be 100%, which pushes the right column off-screen. */
+      grid-template-columns: minmax(10rem, 1fr) minmax(0, 44rem) minmax(10rem, 1fr);
       grid-template-rows: auto minmax(0, 1fr) auto;
       gap: 0.75rem;
       padding: 0.85rem;

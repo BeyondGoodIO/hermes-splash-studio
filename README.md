@@ -9,7 +9,20 @@ Customize the empty new-chat screen in the [Hermes](https://github.com/NousResea
 
 Ongoing chats are never touched. Turn Splash Studio off and everything goes back to stock. It's one plain JavaScript file with no build step and no dependencies.
 
-<!-- Screenshots go here -->
+![Splash Studio with the Stars imagery, a custom serif title and the side widgets](screenshots/styled.jpg)
+
+<details>
+<summary>More screenshots</summary>
+
+The defaults: Atelier imagery, the stock title, clock, model and starter prompts.
+
+![Splash Studio defaults](screenshots/default.jpg)
+
+The settings page.
+
+![Splash Studio settings](screenshots/settings.jpg)
+
+</details>
 
 ## Install
 
