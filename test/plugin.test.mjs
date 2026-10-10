@@ -48,9 +48,12 @@ export const host = globalThis.__host
 const sessions = [{ id: 's1', title: 'First chat', message_count: 3 }, { id: 's2', title: '', preview: 'preview two', message_count: 1 }, { id: 's3', title: 'empty', message_count: 0 }]
 let requests = 0
 const model = (() => { let v = 'anthropic/claude-opus'; const subs = new Set(); return { get: () => v, set: n => { v = n; subs.forEach(f => f(v)) }, subscribe: f => { subs.add(f); f(v); return () => subs.delete(f) } } })()
+const makeAtom = v => { const subs = new Set(); return { get: () => v, set: n => { v = n; subs.forEach(f => f(v)) }, subscribe: f => { subs.add(f); f(v); return () => subs.delete(f) } } }
+const profile = makeAtom('default')
+let roster = []
 globalThis.__host = {
-  state: { model, profile: { get: () => 'default', subscribe: f => { f('default'); return () => {} } } },
-  request: async () => { requests++; return { sessions } },
+  state: { model, profile },
+  request: async method => { requests++; return method === 'profiles.list' ? { profiles: roster } : { sessions } },
   notify: () => {},
   navigate: () => {},
   settings: { set: () => {} },
@@ -211,6 +214,52 @@ await test('title text rewrite hits visible text and width twin, restores on cle
   assert.equal(mark.getAttribute('aria-label'), 'HERMES AGENT')
 })
 
+const setInput = async (placeholderStart, value) => {
+  const input = [...host.querySelectorAll('input')].find(i => (i.placeholder || '').startsWith(placeholderStart))
+  assert.ok(input, `input "${placeholderStart}" missing`)
+  const d = Object.getOwnPropertyDescriptor(w.HTMLInputElement.prototype, 'value')
+  await act(async () => { d.set.call(input, value); input.dispatchEvent(new w.Event('input', { bubbles: true })) })
+  await tick(120)
+}
+
+await test('blank title shows the profile display name; unnamed default keeps stock', async () => {
+  const mark = () => bounds.querySelector('.wordmark')
+  assert.equal(mark().textContent, 'HERMES AGENTHERMES AGENT', 'unnamed default should stay stock')
+  roster = [{ name: 'default', is_default: true, display_name: 'devin' }, { name: 'work', display_name: '' }]
+  profile.set('default')
+  await tick(150)
+  assert.equal(mark().textContent, 'DEVINDEVIN')
+  assert.equal(mark().getAttribute('aria-label'), 'DEVIN')
+  assert.ok(document.querySelector('.sh-meta').textContent.includes('devin'), 'side card should use display name')
+  profile.set('work')
+  await tick(150)
+  assert.equal(mark().textContent, 'WORKWORK', 'falls back to the profile name')
+  await setInput('Title text', 'Mine')
+  assert.equal(mark().textContent, 'MineMine', 'typed title wins')
+  await setInput('Title text', '')
+  const toggle = [...host.querySelectorAll('label')].find(l => l.textContent.includes('show the profile name')).querySelector('input')
+  await act(async () => { toggle.click() })
+  await tick(120)
+  assert.equal(mark().textContent, 'HERMES AGENTHERMES AGENT', 'toggle off restores stock')
+  await act(async () => { toggle.click() })
+  profile.set('default')
+  await tick(150)
+  assert.equal(storage.get('profileNames').default, 'devin', 'names remembered for next launch')
+})
+
+await test('line underneath can be rewritten, survives the app changing it, and restores', async () => {
+  const line = () => bounds.querySelector('[data-slot="aui_intro"] p:last-child')
+  await setInput('Line underneath', 'Ready when you are.')
+  assert.equal(line().textContent, 'Ready when you are.')
+  assert.equal(bounds.querySelector('.wordmark').textContent, 'DEVINDEVIN', 'title untouched')
+  // The app swaps its own line (e.g. a locale change) while ours is active.
+  line().firstChild.nodeValue = 'app line two'
+  await tick(150)
+  assert.equal(line().textContent, 'Ready when you are.', 'custom line re-applied')
+  await setInput('Line underneath', '')
+  assert.equal(line().textContent, 'app line two', "restores the app's latest line")
+})
+
 await test('turning off removes stage AND title changes', async () => {
   const titleInput = [...host.querySelectorAll('input')].find(i => (i.placeholder || '').startsWith('Title text'))
   const d = Object.getOwnPropertyDescriptor(w.HTMLInputElement.prototype, 'value')
@@ -251,7 +300,7 @@ await test('reset needs two clicks and restores defaults', async () => {
   await act(async () => { reset().click() })
   assert.equal(storage.get('prefs').strength, 34)
   assert.deepEqual(storage.get('prefs').prompts.length, 3)
-  assert.deepEqual(storage.get('prefs').title, { show: true, tagline: true, text: '', family: 'stock', customFamily: '', size: 0, color: '', glow: false })
+  assert.deepEqual(storage.get('prefs').title, { show: true, tagline: true, text: '', profileName: true, taglineText: '', family: 'stock', customFamily: '', size: 0, color: '', glow: false })
   const urlInput = [...host.querySelectorAll('input')].find(i => (i.placeholder || '').startsWith('https://'))
   assert.equal(urlInput.value, '')
   assert.ok(!host.textContent.includes('Use an https:// image address.'))

@@ -4,7 +4,8 @@ Customize the empty new-chat screen in the [Hermes](https://github.com/NousResea
 
 - **Imagery behind the splash:** five built-in presets drawn in your theme's colors, your own image, or an https image URL
 - **Side widgets:** clock and greeting, profile and model, recent chats, and up to three starter prompts (clicking one fills the composer, it never sends)
-- **The big title:** rewrite the text, change the font, size and color, hide it, or hide the line under it
+- **The big title:** rewrite the text, change the font, size and color, or hide it. Left blank, it shows your profile's name instead of "Hermes Agent".
+- **The line under the title:** write your own, or hide it
 - **An optional soft glow** in your theme's accent color
 
 Ongoing chats are never touched. Turn Splash Studio off and everything goes back to stock. It's one plain JavaScript file with no build step and no dependencies.
@@ -46,7 +47,7 @@ If you tried the pre-release version called Stagehand, delete `~/.hermes/desktop
 
 ## Privacy
 
-Splash Studio has no server and no tracking. It asks your own Hermes backend for your recent chat titles, the same way the app's sidebar does. The only outside request it can make is loading an image URL you type in yourself. That image is fetched from its website each time a new chat opens, so that site can see when you open new chats. A local image you choose is stored by the Hermes app on your computer and never leaves it.
+Splash Studio has no server and no tracking. It asks your own Hermes backend for your recent chat titles and your profile names, the same way the app's sidebar does. The only outside request it can make is loading an image URL you type in yourself. That image is fetched from its website each time a new chat opens, so that site can see when you open new chats. A local image you choose is stored by the Hermes app on your computer and never leaves it.
 
 ## Remove
 

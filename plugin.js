@@ -71,7 +71,9 @@ const DEFAULTS = {
   title: {
     show: true,
     tagline: true,
-    text: '', // '' = the stock title
+    text: '', // '' = the profile name (or the stock title)
+    profileName: true, // blank title shows the profile's display name instead of "Hermes Agent"
+    taglineText: '', // '' = Hermes's own line
     family: 'stock', // stock | serif | sans | mono | custom
     customFamily: '',
     size: 0, // px; 0 = auto-fit to the column (stock behavior)
@@ -173,6 +175,8 @@ function cloneTitle(value) {
     show: t.show !== false,
     tagline: t.tagline !== false,
     text: typeof t.text === 'string' ? t.text.slice(0, 60) : d.text,
+    profileName: t.profileName !== false,
+    taglineText: typeof t.taglineText === 'string' ? t.taglineText.slice(0, 160) : d.taglineText,
     family: FAMILY_OPTIONS.some(item => item.id === t.family) ? t.family : d.family,
     customFamily: typeof t.customFamily === 'string' ? sanitizeFamily(t.customFamily) : '',
     size: Number.isFinite(size) ? Math.min(240, Math.max(0, Math.round(size))) : 0,
@@ -283,6 +287,65 @@ function modelLabel() {
 function profileLabel() {
   const profile = host.state && host.state.profile ? String(host.state.profile.get() || '') : ''
   return profile || 'profile'
+}
+
+// Profile display names ("devin" for a renamed default profile) come from the gateway's
+// profiles.list. Fetched once and refreshed when the active profile changes.
+let profileRoster = null
+let profileRosterInflight = null
+// Last-known names from a previous run, so the title doesn't flash "Hermes Agent" at startup.
+let profileNamesSeen = {}
+
+function currentProfile() {
+  return host.state && host.state.profile ? String(host.state.profile.get() || '') : ''
+}
+
+async function loadProfileRoster() {
+  if (profileRosterInflight || typeof host.request !== 'function') return
+  profileRosterInflight = (async () => {
+    try {
+      // Names only: skip the per-profile session previews this call includes by default.
+      const result = await host.request('profiles.list', { include_sessions: false }, 5000)
+      const roster = new Map()
+      for (const row of Array.isArray(result?.profiles) ? result.profiles : []) {
+        if (!row || !row.name) continue
+        const label = String(row.display_name || '').trim() || String(row.name)
+        roster.set(String(row.name), label)
+        if (row.is_default) roster.set('default', label)
+      }
+      profileRoster = roster
+      profileNamesSeen = Object.fromEntries(roster)
+      pluginCtx?.storage.set('profileNames', profileNamesSeen)
+    } catch {
+      // Fall back to the raw profile name; don't retry on every sync.
+      profileRoster = new Map()
+    } finally {
+      profileRosterInflight = null
+      if (!disposed) scheduleSync()
+    }
+  })()
+}
+
+// The title for a blank title field: the profile's display name, upper-cased to match the
+// stock wordmark. An unnamed default profile keeps the stock "Hermes Agent".
+function profileTitle() {
+  const name = currentProfile()
+  if (!name) return ''
+  if (profileRoster === null) void loadProfileRoster()
+  const known = knownProfileName(name)
+  const label = known || (name === 'default' ? '' : name)
+  return label ? label.toUpperCase() : ''
+}
+
+function knownProfileName(name) {
+  if (profileRoster) return profileRoster.get(name) || ''
+  return Object.hasOwn(profileNamesSeen, name) && typeof profileNamesSeen[name] === 'string' ? profileNamesSeen[name] : ''
+}
+
+// Profile name for the side card: display name when known, else the raw name.
+function displayProfile() {
+  const name = currentProfile()
+  return (name && knownProfileName(name)) || profileLabel()
 }
 
 function ensureStyle() {
@@ -445,22 +508,32 @@ function titleCss(t) {
   return out.join('\n')
 }
 
-// Swap the words by rewriting the wordmark's text nodes in place. React keeps its own
-// references to those nodes, so editing nodeValue is safe; the original is remembered
-// per node and restored when the field is cleared.
+const TAGLINE = "[data-slot='aui_intro'] p:last-child:not(.wordmark)"
+
+// Swap words by rewriting text nodes in place. React keeps its own references to those
+// nodes, so editing nodeValue is safe. Each node remembers its original text and the text
+// we last wrote: if the app later writes something new (a locale or personality change),
+// that becomes the new original instead of being lost.
+function rewriteText(root, text) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (text) {
+      if (n.__shApplied !== undefined && n.nodeValue !== n.__shApplied) n.__shOrig = n.nodeValue
+      if (n.__shOrig === undefined) n.__shOrig = n.nodeValue
+      if (n.nodeValue !== text) n.nodeValue = text
+      n.__shApplied = text
+    } else if (n.__shOrig !== undefined) {
+      if (n.nodeValue === n.__shApplied) n.nodeValue = n.__shOrig
+      delete n.__shOrig
+      delete n.__shApplied
+    }
+  }
+}
+
 function syncTitleText(text) {
   for (const mark of document.querySelectorAll(TITLE_MARK)) {
-    const walker = document.createTreeWalker(mark, NodeFilter.SHOW_TEXT)
-
-    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-      if (text) {
-        if (n.__shOrig === undefined) n.__shOrig = n.nodeValue
-        if (n.nodeValue !== text) n.nodeValue = text
-      } else if (n.__shOrig !== undefined) {
-        n.nodeValue = n.__shOrig
-        delete n.__shOrig
-      }
-    }
+    rewriteText(mark, text)
 
     if (text) {
       if (mark.__shLabel === undefined) mark.__shLabel = mark.getAttribute('aria-label') ?? ''
@@ -470,6 +543,17 @@ function syncTitleText(text) {
       delete mark.__shLabel
     }
   }
+}
+
+function syncTaglineText(text) {
+  for (const line of document.querySelectorAll(TAGLINE)) rewriteText(line, text)
+}
+
+// What the big title should say: your own text, else the profile's name, else stock.
+function titleText(t) {
+  if (t.text) return t.text
+  if (!t.profileName) return ''
+  return profileTitle()
 }
 
 function syncTitle() {
@@ -485,11 +569,13 @@ function syncTitle() {
 
   if (titleStyleEl.textContent !== css) titleStyleEl.textContent = css
   document.documentElement.setAttribute(TITLE_ATTR, '')
-  syncTitleText(t.text)
+  syncTitleText(titleText(t))
+  syncTaglineText(t.tagline ? t.taglineText : '')
 }
 
 function removeTitle() {
   syncTitleText('')
+  syncTaglineText('')
   titleStyleEl?.remove()
   titleStyleEl = null
   document.documentElement.removeAttribute(TITLE_ATTR)
@@ -590,7 +676,7 @@ function fillCard(card, prefs, rows) {
   }
   if (card.dataset.role === 'meta' && prefs.widgets.model) {
     card.append(el('div', 'sh-kicker', 'New chat'))
-    card.append(el('div', 'sh-sub', `${profileLabel()} · ${modelLabel()}`))
+    card.append(el('div', 'sh-sub', `${displayProfile()} · ${modelLabel()}`))
     if ($imageError.get()) card.append(el('div', 'sh-sub', $imageError.get()))
     card.hidden = false
     return
@@ -705,6 +791,13 @@ function ensureStage(bounds) {
   // A freshly shown new-chat screen should list current chats, not a cached list.
   sessionsCache.at = 0
   record = { art, widgets, clock, meta, recents, prompts, signature: '' }
+  // The app can rewrite the intro's own text (a locale or personality change) without
+  // adding nodes. Watch just this intro for that, so custom words get re-applied.
+  const intro = bounds.querySelector(INTRO)
+  if (intro && typeof MutationObserver === 'function') {
+    record.introObserver = new MutationObserver(scheduleSync)
+    record.introObserver.observe(intro, { characterData: true, subtree: true })
+  }
   stages.set(bounds, record)
   return record
 }
@@ -712,6 +805,7 @@ function ensureStage(bounds) {
 function dropStage(bounds) {
   const record = stages.get(bounds)
   if (!record) return
+  record.introObserver?.disconnect()
   record.art.remove()
   record.widgets.remove()
   stages.delete(bounds)
@@ -721,7 +815,7 @@ function widgetSignature(prefs) {
   return JSON.stringify({
     widgets: prefs.widgets,
     prompts: prefs.prompts,
-    profile: profileLabel(),
+    profile: displayProfile(),
     model: modelLabel(),
     error: $imageError.get()
   })
@@ -1133,14 +1227,28 @@ function TitleSection({ prefs }) {
     children: [
       jsx('div', { className: 'text-(--ui-text-primary)', children: 'Title' }),
       jsx(WidgetToggle, { label: 'Show the big title', checked: t.show, onChange: show => set({ show }) }),
-      jsx(WidgetToggle, { label: 'Show the line underneath', checked: t.tagline, onChange: tagline => set({ tagline }) }),
-      jsx(WidgetToggle, { label: 'Soft accent glow', checked: t.glow, onChange: glow => set({ glow }) }),
       jsx(Input, {
-        placeholder: 'Title text (blank = Hermes Agent)',
+        placeholder: t.profileName ? 'Title text (blank = your profile name)' : 'Title text (blank = Hermes Agent)',
+        'aria-label': 'Title text',
         maxLength: 60,
         value: t.text,
         onChange: event => set({ text: event.target.value })
       }),
+      jsx(WidgetToggle, {
+        label: 'When the title is blank, show the profile name',
+        checked: t.profileName,
+        onChange: profileName => set({ profileName })
+      }),
+      jsx(WidgetToggle, { label: 'Show the line underneath', checked: t.tagline, onChange: tagline => set({ tagline }) }),
+      jsx(Input, {
+        placeholder: "Line underneath (blank = Hermes's own)",
+        'aria-label': 'Line underneath the title',
+        maxLength: 160,
+        disabled: !t.tagline,
+        value: t.taglineText,
+        onChange: event => set({ taglineText: event.target.value })
+      }),
+      jsx(WidgetToggle, { label: 'Soft accent glow', checked: t.glow, onChange: glow => set({ glow }) }),
       jsx('div', {
         className: 'flex flex-wrap gap-1.5',
         children: FAMILY_OPTIONS.map(item => jsx(Button, {
@@ -1338,6 +1446,14 @@ export default {
     const stored = ctx.storage.get('prefs', {})
     $prefs.set(clonePrefs(stored && typeof stored === 'object' ? stored : {}))
     localImage = safeImageUrl(ctx.storage.get('image', ''))
+    const seen = ctx.storage.get('profileNames', {})
+    profileNamesSeen = {}
+    if (seen && typeof seen === 'object') {
+      for (const [key, value] of Object.entries(seen)) {
+        if (typeof value === 'string') profileNamesSeen[key] = value.slice(0, 80)
+      }
+    }
+    profileRoster = null
     $hasImage.set(Boolean(localImage))
     lastPaletteKey = paletteKey()
 
@@ -1382,9 +1498,12 @@ export default {
     const unsub = $prefs.subscribe(() => scheduleSync())
     // Keep the profile/model card current when either changes on the new-chat screen.
     const stateUnsubs = ['model', 'profile']
-      .map(key => host.state?.[key])
-      .filter(value => value && typeof value.subscribe === 'function')
-      .map(value => value.subscribe(() => scheduleSync()))
+      .filter(key => host.state?.[key] && typeof host.state[key].subscribe === 'function')
+      .map(key => host.state[key].subscribe(() => {
+        // A profile switch (or a newly created profile) needs a fresh display name.
+        if (key === 'profile') profileRoster = null
+        scheduleSync()
+      }))
     ctx.onDispose(() => {
       disposed = true
       unsub()
