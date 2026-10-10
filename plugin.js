@@ -29,6 +29,8 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'splash-studio'
 const NAME = 'Splash Studio'
+const DESCRIPTION =
+  'Customizes the empty new-chat screen: background imagery, side widgets (clock, model, recent chats, starter prompts) and the big title. Ongoing chats are never touched.'
 const STYLE_ID = 'splash-studio-css'
 const TITLE_STYLE_ID = 'splash-studio-title-css'
 const TITLE_ATTR = 'data-splash-studio'
@@ -967,6 +969,16 @@ function SettingsPanel() {
     className: 'flex flex-col gap-4 text-sm text-(--ui-text-secondary)',
     children: [
       jsxs('div', {
+        className: 'flex flex-col gap-1',
+        children: [
+          jsx('p', { className: 'm-0 text-(--ui-text-primary)', children: 'Make the new-chat screen your own.' }),
+          jsx('p', {
+            className: 'm-0 text-xs text-(--ui-text-tertiary)',
+            children: 'Splash Studio dresses up the screen you see when you start a new chat, before you send anything: an image behind it, small cards on the sides, and your own title. Open a new chat to see your changes. Ongoing chats are never touched.'
+          })
+        ]
+      }),
+      jsxs('div', {
         className: 'flex items-center justify-between gap-3',
         children: [
           jsxs('div', {
@@ -1317,6 +1329,7 @@ function ResetButton() {
 export default {
   id: ID,
   name: NAME,
+  description: DESCRIPTION,
   register(ctx) {
     pluginCtx = ctx
     disposed = false

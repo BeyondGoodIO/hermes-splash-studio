@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A short description under Splash Studio in Capabilities > Plugins, and an intro at the top of its settings page, so it's clear what the plugin does
+
 ## 1.0.0 (2026-10-09)
 
 First public release.

@@ -144,6 +144,8 @@ const root = createRoot(host)
 await test('settings panel renders without errors', async () => {
   await act(async () => { root.render(settings.render()) })
   assert.ok(host.textContent.includes('Show on new chats'))
+  assert.ok(host.textContent.includes('Make the new-chat screen your own.'), 'settings intro missing')
+  assert.match(plugin.description, /new-chat screen/, 'plugin description missing')
 })
 
 await test('URL field does not apply while typing, applies on Enter (https only)', async () => {
